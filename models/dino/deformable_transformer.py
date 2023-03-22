@@ -10,8 +10,6 @@
 # Modified from DETR (https://github.com/facebookresearch/detr)
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
-
-import random
 import copy
 from typing import Optional
 
@@ -39,16 +37,12 @@ class DeformableTransformer(nn.Module):
                  num_feature_levels=1,
                  enc_n_points=4,
                  dec_n_points=4,
-                 use_deformable_box_attn=False,
-                 box_attn_type='roi_align',
                  # init query
-                 add_channel_attention=False,
                  random_refpoints_xy=False,
                  # two stage
                  two_stage_type='standard',
                  # for detach
-                 decoder_sa_type='ca',
-                 module_seq=['sa', 'ca', 'ffn']):
+                 module_seq=None):
         super().__init__()
         """
         d_model: 编码器里面mlp（前馈神经网络  2个linear层）的hidden dim 512
@@ -67,9 +61,7 @@ class DeformableTransformer(nn.Module):
                                                           activation,
                                                           num_feature_levels,
                                                           nhead, enc_n_points,
-                                                          add_channel_attention=add_channel_attention,
-                                                          use_deformable_box_attn=use_deformable_box_attn,
-                                                          box_attn_type=box_attn_type)
+                                                          )
         # 创建整个Encoder层  6个encoder层堆叠
         self.encoder = TransformerEncoder(
             encoder_layer=encoder_layer,
@@ -84,10 +76,7 @@ class DeformableTransformer(nn.Module):
                                                           activation,
                                                           num_feature_levels,
                                                           nhead, dec_n_points,
-                                                          use_deformable_box_attn=use_deformable_box_attn,
-                                                          box_attn_type=box_attn_type,
                                                           key_aware_type=None,
-                                                          decoder_sa_type=decoder_sa_type,
                                                           module_seq=module_seq)
         # 创建整个Decoder层  6个decoder层堆叠
         self.decoder = TransformerDecoder(decoder_layer,
@@ -104,7 +93,6 @@ class DeformableTransformer(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.num_queries = num_queries
         self.random_refpoints_xy = random_refpoints_xy
-        self.decoder_sa_type = decoder_sa_type
         self.d_model = d_model  # 编码器里面mlp的hidden dim 512
         self.nhead = nhead  # 多头注意力头数 8
         self.dec_layers = num_decoder_layers
@@ -184,6 +172,7 @@ class DeformableTransformer(nn.Module):
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
+        bs, c, h, w = (0, 0, 0, 0)
         for lvl, (src, mask, pos_embed) in enumerate(zip(multi_level_feats, multi_level_masks, multi_level_pos_embeds)):
             bs, c, h, w = src.shape  # batch_size channel h w
             spatial_shape = (h, w)  # 特征图shape
@@ -587,17 +576,10 @@ class DeformableTransformerEncoderLayer(nn.Module):
                  n_levels=4,
                  n_heads=8,
                  n_points=4,
-                 add_channel_attention=False,
-                 use_deformable_box_attn=False,
-                 box_attn_type='roi_align',
                  ):
         super().__init__()
         # self attention
-        if use_deformable_box_attn:
-            self.self_attn = MSDeformableBoxAttention(d_model, n_levels, n_heads, n_boxes=n_points,
-                                                      used_func=box_attn_type)
-        else:
-            self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+        self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -608,12 +590,6 @@ class DeformableTransformerEncoderLayer(nn.Module):
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout3 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-
-        # channel attention
-        self.add_channel_attention = add_channel_attention
-        if add_channel_attention:
-            self.activ_channel = _get_activation_fn('dyrelu', d_model=d_model)
-            self.norm_channel = nn.LayerNorm(d_model)
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -638,7 +614,6 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # query = flatten后的多尺度特征图 + scale-level pos
         # key = 采样点  每个特征点对应周围的4个可学习的采样点
         # value = flatten后的多尺度特征图
-
         # self attention
         src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index,
                               key_padding_mask)
@@ -648,10 +623,6 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # ffn   feed forward + add + norm
         src = self.forward_ffn(src)
 
-        # channel attn
-        if self.add_channel_attention:
-            src = self.norm_channel(src + self.activ_channel(src))
-
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         return src
 
@@ -660,21 +631,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
                  n_levels=4, n_heads=8, n_points=4,
-                 use_deformable_box_attn=False,
-                 box_attn_type='roi_align',
                  key_aware_type=None,
-                 decoder_sa_type='ca',
-                 module_seq=['sa', 'ca', 'ffn'],
+                 module_seq=None,
                  ):
         super().__init__()
         self.module_seq = module_seq
         assert sorted(module_seq) == ['ca', 'ffn', 'sa']
         # cross attention
-        if use_deformable_box_attn:
-            self.cross_attn = MSDeformableBoxAttention(d_model, n_levels, n_heads, n_boxes=n_points,
-                                                       used_func=box_attn_type)
-        else:
-            self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -693,11 +657,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         self.key_aware_type = key_aware_type
         self.key_aware_proj = None
-        self.decoder_sa_type = decoder_sa_type
-        assert decoder_sa_type in ['sa', 'ca_label', 'ca_content']
-
-        if decoder_sa_type == 'ca_content':
-            self.self_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
 
     def rm_self_attn_modules(self):
         self.self_attn = None
@@ -718,46 +677,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
                    # for tgt
                    tgt: Optional[Tensor],  # nq, bs, d_model
                    tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                   tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
-                   tgt_key_padding_mask: Optional[Tensor] = None,
-                   tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
-
-                   # for memory
-                   memory: Optional[Tensor] = None,  # hw, bs, d_model
-                   memory_key_padding_mask: Optional[Tensor] = None,
-                   memory_level_start_index: Optional[Tensor] = None,  # num_levels
-                   memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-                   memory_pos: Optional[Tensor] = None,  # pos for memory
-
                    # sa
                    self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
-                   cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
                    ):
         # self attention
-        if self.self_attn is not None:
-            if self.decoder_sa_type == 'sa':
-                q = k = self.with_pos_embed(tgt, tgt_query_pos)
-                # self-attention
-                # 第一个attention的目的：学习各个物体之间的关系/位置   可以知道图像当中哪些位置会存在物体  物体信息->tgt
-                # 所以qk都是query embedding + query pos   v就是query embedding
-                tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-                tgt = tgt + self.dropout2(tgt2)
-                tgt = self.norm2(tgt)
-            elif self.decoder_sa_type == 'ca_label':
-                bs = tgt.shape[1]
-                k = v = self.label_embedding.weight[:, None, :].repeat(1, bs, 1)
-                tgt2 = self.self_attn(tgt, k, v, attn_mask=self_attn_mask)[0]
-                tgt = tgt + self.dropout2(tgt2)
-                tgt = self.norm2(tgt)
-            elif self.decoder_sa_type == 'ca_content':
-                tgt2 = self.self_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
-                                      tgt_reference_points.transpose(0, 1).contiguous(),
-                                      memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
-                                      memory_key_padding_mask).transpose(0, 1)
-                tgt = tgt + self.dropout2(tgt2)
-                tgt = self.norm2(tgt)
-            else:
-                raise NotImplementedError("Unknown decoder_sa_type {}".format(self.decoder_sa_type))
+        q = k = self.with_pos_embed(tgt, tgt_query_pos)
+        # 第一个attention的目的：学习各个物体之间的关系/位置   可以知道图像当中哪些位置会存在物体  物体信息->tgt
+        # 所以qk都是query embedding + query pos   v就是query embedding
+        tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
 
         return tgt
 
@@ -765,8 +694,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
                    # for tgt
                    tgt: Optional[Tensor],  # nq, bs, d_model
                    tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                   tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
-                   tgt_key_padding_mask: Optional[Tensor] = None,
                    tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
 
                    # for memory
@@ -774,11 +701,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
                    memory_key_padding_mask: Optional[Tensor] = None,
                    memory_level_start_index: Optional[Tensor] = None,  # num_levels
                    memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-                   memory_pos: Optional[Tensor] = None,  # pos for memory
-
-                   # sa
-                   self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
-                   cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
                    ):
         # cross attention
         if self.key_aware_type is not None:
@@ -836,26 +758,27 @@ class DeformableTransformerDecoderLayer(nn.Module):
             if funcname == 'ffn':
                 tgt = self.forward_ffn(tgt)
             elif funcname == 'ca':
-                tgt = self.forward_ca(tgt, tgt_query_pos, tgt_query_sine_embed, \
-                                      tgt_key_padding_mask, tgt_reference_points, \
-                                      memory, memory_key_padding_mask, memory_level_start_index, \
-                                      memory_spatial_shapes, memory_pos, self_attn_mask, cross_attn_mask)
+                tgt = self.forward_ca(tgt=tgt,
+                                      tgt_query_pos=tgt_query_pos,
+                                      tgt_reference_points=tgt_reference_points,
+                                      memory=memory,
+                                      memory_key_padding_mask=memory_key_padding_mask,
+                                      memory_level_start_index=memory_level_start_index,
+                                      memory_spatial_shapes=memory_spatial_shapes,
+                                      )
             elif funcname == 'sa':
-                tgt = self.forward_sa(tgt, tgt_query_pos, tgt_query_sine_embed, \
-                                      tgt_key_padding_mask, tgt_reference_points, \
-                                      memory, memory_key_padding_mask, memory_level_start_index, \
-                                      memory_spatial_shapes, memory_pos, self_attn_mask, cross_attn_mask)
-            else:
-                raise ValueError('unknown funcname {}'.format(funcname))
+                tgt = self.forward_sa(tgt=tgt,
+                                      tgt_query_pos=tgt_query_pos,
+                                      self_attn_mask=self_attn_mask, )
 
         return tgt
 
 
-def _get_clones(module, N, layer_share=False):
+def _get_clones(module, size, layer_share=False):
     if layer_share:
-        return nn.ModuleList([module for i in range(N)])
+        return nn.ModuleList([module for _ in range(size)])
     else:
-        return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+        return nn.ModuleList([copy.deepcopy(module) for _ in range(size)])
 
 
 def build_deformable_transformer(args):
@@ -874,12 +797,8 @@ def build_deformable_transformer(args):
         num_feature_levels=args.num_feature_levels,
         enc_n_points=args.enc_n_points,
         dec_n_points=args.dec_n_points,
-        use_deformable_box_attn=args.use_deformable_box_attn,
-        box_attn_type=args.box_attn_type,
-        add_channel_attention=args.add_channel_attention,
         random_refpoints_xy=args.random_refpoints_xy,
         # two stage
         two_stage_type=args.two_stage_type,
-        decoder_sa_type=args.decoder_sa_type,
         module_seq=args.decoder_module_seq,
     )
