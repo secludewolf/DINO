@@ -79,14 +79,10 @@ class DeformableTransformer(nn.Module):
                                                           box_attn_type=box_attn_type)
         # 创建整个Encoder层  6个encoder层堆叠
         self.encoder = TransformerEncoder(
-            encoder_layer,
-            num_encoder_layers,
-            None,
+            encoder_layer=encoder_layer,
+            num_layers=num_encoder_layers,
             d_model=d_model,
-            num_queries=num_queries,
-            deformable_encoder=True,
-            enc_layer_share=False,
-        )
+            num_queries=num_queries,)
 
         # 初始化一个decoderLayer
         decoder_layer = DeformableTransformerDecoderLayer(d_model,
@@ -386,36 +382,21 @@ class TransformerEncoder(nn.Module):
     def __init__(self,
                  encoder_layer,
                  num_layers,
-                 norm=None,
                  d_model=256,
                  num_queries=300,
-                 deformable_encoder=False,
-                 enc_layer_share=False,
-                 enc_layer_dropout_prob=None,
                  ):
         super().__init__()
         # prepare layers
         if num_layers > 0:
             # 6层DeformableTransformerEncoderLayer
-            self.layers = _get_clones(encoder_layer, num_layers, layer_share=enc_layer_share)
+            self.layers = _get_clones(encoder_layer, num_layers, layer_share=False)
         else:
             self.layers = []
             del encoder_layer
 
-        self.query_scale = None
         self.num_queries = num_queries
-        self.deformable_encoder = deformable_encoder
         self.num_layers = num_layers
-        self.norm = norm
         self.d_model = d_model
-
-        self.enc_layer_dropout_prob = enc_layer_dropout_prob
-        if enc_layer_dropout_prob is not None:
-            assert isinstance(enc_layer_dropout_prob, list)
-            assert len(enc_layer_dropout_prob) == num_layers
-            for i in enc_layer_dropout_prob:
-                assert 0.0 <= i <= 1.0
-
         self.two_stage_type = "standard"
 
     @staticmethod
@@ -491,24 +472,10 @@ class TransformerEncoder(nn.Module):
         # preparation and reshape
         # 4个flatten后特征图的归一化参考点坐标 每个特征点有4个参考点 xy坐标 [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=query.device)
-
-        # main process
         for layer_id, layer in enumerate(self.layers):
-            # main process
-            dropflag = False  # if not dropflag 一起删除 从未被修改,一定进入if语句
-            if self.enc_layer_dropout_prob is not None:  # 未进入 默认enc_layer_dropout_prob=None
-                prob = random.random()
-                if prob < self.enc_layer_dropout_prob[layer_id]:
-                    dropflag = True
-            if not dropflag:  # 一定进入
-                if self.deformable_encoder:  # 一定使用deformable_encoder 默认为True
-                    output = layer(src=output, pos=query_pos, reference_points=reference_points,
-                                   spatial_shapes=spatial_shapes, level_start_index=level_start_index,
-                                   key_padding_mask=query_key_padding_mask)
-                else:  # 应该不会适应普通encoder 一般不会进入
-                    output = layer(src=output.transpose(0, 1), pos=query_pos.transpose(0, 1),
-                                   key_padding_mask=query_key_padding_mask).transpose(0, 1)
-
+            output = layer(src=output, pos=query_pos, reference_points=reference_points,
+                           spatial_shapes=spatial_shapes, level_start_index=level_start_index,
+                           key_padding_mask=query_key_padding_mask)
         # 经过6层encoder增强后的新特征  每一层不断学习特征层中每个位置和4个采样点的相关性，最终输出的特征是增强后的特征图
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         return output
@@ -732,9 +699,13 @@ class TransformerDecoder(nn.Module):
 
 class DeformableTransformerEncoderLayer(nn.Module):
     def __init__(self,
-                 d_model=256, d_ffn=1024,
-                 dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4,
+                 d_model=256,
+                 d_ffn=1024,
+                 dropout=0.1,
+                 activation="relu",
+                 n_levels=4,
+                 n_heads=8,
+                 n_points=4,
                  add_channel_attention=False,
                  use_deformable_box_attn=False,
                  box_attn_type='roi_align',
