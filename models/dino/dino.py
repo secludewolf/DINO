@@ -364,7 +364,7 @@ class DINO(nn.Module):
         hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(multi_level_feats=srcs,
                                                                              multi_level_masks=masks,
                                                                              multi_level_pos_embeds=poss,
-                                                                             irefpoint_embed=input_query_bbox,
+                                                                             refpoint_embed=input_query_bbox,
                                                                              tgt=input_query_label,
                                                                              attn_mask=attn_mask,
                                                                              yolo_ref_points=yolo_ref_points)
