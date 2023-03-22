@@ -47,7 +47,6 @@ class DeformableTransformer(nn.Module):
                  random_refpoints_xy=False,
                  # two stage
                  two_stage_type='standard',
-                 two_stage_keep_all_tokens=False,
                  # evo of #anchors
                  rm_dec_query_scale=True,
                  # for detach
@@ -122,7 +121,6 @@ class DeformableTransformer(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.num_unicoder_layers = num_unicoder_layers
         self.num_decoder_layers = num_decoder_layers
-        self.two_stage_keep_all_tokens = two_stage_keep_all_tokens
         self.num_queries = num_queries
         self.random_refpoints_xy = random_refpoints_xy
         self.use_detached_boxes_dec_out = use_detached_boxes_dec_out
@@ -268,76 +266,50 @@ class DeformableTransformer(nn.Module):
         # one-stage: query和query pos就是预设的query_embed,然后将query_embed经过全连接层输出2d参考点（归一化的中心坐标）
 
         '''处理encoder输出结果'''
+        input_hw = None
+        # (bs, \sum{hw}, c)
+        # 对memory进行处理得到output_memory: [bs, H/8 * W/8 + ... + H/64 * W/64, 256]
+        # 并生成初步output_proposals: [bs, H/8 * W/8 + ... + H/64 * W/64, 4]  其实就是特征图上的一个个的点坐标
+        output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes,
+                                                                       input_hw)
+        # 对encoder输出进行处理：全连接层 + LayerNorm
+        output_memory = self.enc_output_norm(self.enc_output(output_memory))
 
-        if 'standard' == 'standard':  # 默认使用二阶段,two_stage_type = standard
-            input_hw = None
-            # (bs, \sum{hw}, c)
-            # 对memory进行处理得到output_memory: [bs, H/8 * W/8 + ... + H/64 * W/64, 256]
-            # 并生成初步output_proposals: [bs, H/8 * W/8 + ... + H/64 * W/64, 4]  其实就是特征图上的一个个的点坐标
-            output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes,
-                                                                           input_hw)
-            # 对encoder输出进行处理：全连接层 + LayerNorm
-            output_memory = self.enc_output_norm(self.enc_output(output_memory))
+        # hack implementation for two-stage Deformable DETR
+        # 多分类：[bs, H/8 * W/8 + ... + H/64 * W/64, 256] -> [bs, H/8 * W/8 + ... + H/64 * W/64, 91]
+        # 把每个特征点头还原分类  # 其实个人觉得这里直接进行一个二分类足够了
+        enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
+        # 回归：预测偏移量 + 参考点坐标   [bs, H/8 * W/8 + ... + H/64 * W/64, 4]
+        # 还原所有检测框  # two-stage 必须和 iterative bounding box refinement一起使用 不然bbox_embed=None 报错
+        enc_outputs_coord_unselected = self.enc_out_bbox_embed(
+            output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
+        # 保留前多少个query  # 得到参考点reference_points/先验框
+        topk = self.num_queries
+        # 直接用第一个类别的预测结果来算top-k，代表二分类
+        # 如果不使用iterative bounding box refinement那么所有class_embed共享参数 导致第二阶段对解码输出进行分类时都会偏向于第一个类别
+        # 获取前900个检测结果的位置  # topk_proposals: [bs, 900]  top900 index
+        topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]  # bs, nq
 
-            # hack implementation for two-stage Deformable DETR
-            # 多分类：[bs, H/8 * W/8 + ... + H/64 * W/64, 256] -> [bs, H/8 * W/8 + ... + H/64 * W/64, 91]
-            # 把每个特征点头还原分类  # 其实个人觉得这里直接进行一个二分类足够了
-            enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
-            # 回归：预测偏移量 + 参考点坐标   [bs, H/8 * W/8 + ... + H/64 * W/64, 4]
-            # 还原所有检测框  # two-stage 必须和 iterative bounding box refinement一起使用 不然bbox_embed=None 报错
-            enc_outputs_coord_unselected = self.enc_out_bbox_embed(
-                output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
-            # 保留前多少个query  # 得到参考点reference_points/先验框
-            topk = self.num_queries
-            # 直接用第一个类别的预测结果来算top-k，代表二分类
-            # 如果不使用iterative bounding box refinement那么所有class_embed共享参数 导致第二阶段对解码输出进行分类时都会偏向于第一个类别
-            # 获取前900个检测结果的位置  # topk_proposals: [bs, 900]  top900 index
-            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]  # bs, nq
+        # gather boxes
+        # 根据前九百个位置获取对应的参考点  # topk_coords_unact: top300个分类得分最高的index对应的预测bbox [bs, 900, 4]
+        refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
+                                               topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
+        # 以先验框的形式存在  取消梯度
+        refpoint_embed_ = refpoint_embed_undetach.detach()
+        # 得到归一化参考点坐标  最终会送到decoder中作为初始的参考点
+        init_box_proposal = torch.gather(output_proposals, 1,
+                                         topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid()
 
-            # gather boxes
-            # 根据前九百个位置获取对应的参考点  # topk_coords_unact: top300个分类得分最高的index对应的预测bbox [bs, 900, 4]
-            refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
-                                                   topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
-            # 以先验框的形式存在  取消梯度
-            refpoint_embed_ = refpoint_embed_undetach.detach()
-            # 得到归一化参考点坐标  最终会送到decoder中作为初始的参考点
-            init_box_proposal = torch.gather(output_proposals, 1,
-                                             topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid()
+        # gather tgt  # 根据前九百个位置获取query
+        tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+        tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
 
-            # gather tgt  # 根据前九百个位置获取query
-            tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
-            tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
-
-            if refpoint_embed is not None:  # 训练时进入
-                refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_],
-                                           dim=1)  # 将正常query与cdn正负情绪query的bbox拼接900+200
-                tgt = torch.cat([tgt, tgt_], dim=1)  # 将初始化query与cdn正负情绪query拼接900+200
-            else:  # 默认不进入
-                refpoint_embed, tgt = refpoint_embed_, tgt_
-
-        elif 'standard' == 'no':  # 默认不进入,推理时进入
-            tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
-            refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, 4
-
-            if refpoint_embed is not None:  # 默认进入
-                refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_],
-                                           dim=1)  # 将正常query与cdn正负情绪query的bbox拼接900+200
-                tgt = torch.cat([tgt, tgt_], dim=1)  # 将正常query与cdn正负情绪query拼接900+200
-            else:  # 默认不进入
-                refpoint_embed, tgt = refpoint_embed_, tgt_
-
-            if self.num_patterns > 0:  # 默认不进入
-                tgt_embed = tgt.repeat(1, self.num_patterns, 1)
-                refpoint_embed = refpoint_embed.repeat(1, self.num_patterns, 1)
-                tgt_pat = self.patterns.weight[None, :, :].repeat_interleave(self.num_queries,
-                                                                             1)  # 1, n_q*n_pat, d_model
-                tgt = tgt_embed + tgt_pat
-
-            # 将topk的query的bbox归一化
-            init_box_proposal = refpoint_embed_.sigmoid()
-
-        else:  # 默认不进入
-            raise NotImplementedError("unknown two_stage_type {}".format('standard'))
+        if refpoint_embed is not None:  # 训练 query + cdn_query
+            refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_],
+                                       dim=1)  # 将正常query与cdn正负情绪query的bbox拼接900+200
+            tgt = torch.cat([tgt, tgt_], dim=1)  # 将初始化query与cdn正负情绪query拼接900+200
+        else:  # 推理 query
+            refpoint_embed, tgt = refpoint_embed_, tgt_
 
         # 设置yolo参考点
         if yolo_ref_points is not None:
@@ -388,18 +360,9 @@ class DeformableTransformer(nn.Module):
 
         #########################################################
         # Begin postprocess
-        #########################################################     
-        if 'standard' == 'standard':  # 默认进入
-            if self.two_stage_keep_all_tokens:  # 默认不进入
-                hs_enc = output_memory.unsqueeze(0)
-                ref_enc = enc_outputs_coord_unselected.unsqueeze(0)
-                init_box_proposal = output_proposals
-
-            else:  # 默认进入
-                hs_enc = tgt_undetach.unsqueeze(0)
-                ref_enc = refpoint_embed_undetach.sigmoid().unsqueeze(0)
-        else:  # 默认不进入
-            hs_enc = ref_enc = None
+        #########################################################
+        hs_enc = tgt_undetach.unsqueeze(0)
+        ref_enc = refpoint_embed_undetach.sigmoid().unsqueeze(0)
         #########################################################
         # End postprocess
         # hs_enc: (n_enc+1, bs, nq, d_model) or (1, bs, nq, d_model) or (n_enc, bs, nq, d_model) or None
@@ -1077,7 +1040,6 @@ def build_deformable_transformer(args):
         random_refpoints_xy=args.random_refpoints_xy,
         # two stage
         two_stage_type=args.two_stage_type,
-        two_stage_keep_all_tokens=args.two_stage_keep_all_tokens,
         decoder_sa_type=args.decoder_sa_type,
         module_seq=args.decoder_module_seq,
         use_detached_boxes_dec_out=use_detached_boxes_dec_out

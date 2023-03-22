@@ -349,7 +349,7 @@ class DINO(nn.Module):
                 poss.append(pos_l)
 
         # 生成Transformer参数
-        if self.dn_number > 0 or targets is not None:
+        if self.dn_number > 0 or targets is not None:  # 训练
             input_query_label, input_query_bbox, attn_mask, dn_meta = \
                 prepare_for_cdn(dn_args=(targets, self.dn_number, self.dn_label_noise_ratio, self.dn_box_noise_scale),
                                 training=self.training,
@@ -357,17 +357,17 @@ class DINO(nn.Module):
                                 num_classes=self.num_classes,
                                 hidden_dim=self.hidden_dim,
                                 label_enc=self.label_enc)
-        else:
+        else:  # 推理
             assert targets is None
             input_query_bbox = input_query_label = attn_mask = dn_meta = None
 
-        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs,
-                                                                             masks,
-                                                                             poss,
-                                                                             input_query_bbox,
-                                                                             input_query_label,
-                                                                             attn_mask,
-                                                                             yolo_ref_points)
+        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(multi_level_feats=srcs,
+                                                                             multi_level_masks=masks,
+                                                                             multi_level_pos_embeds=poss,
+                                                                             irefpoint_embed=input_query_bbox,
+                                                                             tgt=input_query_label,
+                                                                             attn_mask=attn_mask,
+                                                                             yolo_ref_points=yolo_ref_points)
         # In case num object=0
         hs[0] += self.label_enc.weight[0, 0] * 0.0
 
