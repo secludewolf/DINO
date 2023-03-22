@@ -11,7 +11,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-import math, random
+import random
 import copy
 from typing import Optional
 
@@ -30,81 +30,34 @@ class DeformableTransformer(nn.Module):
                  num_encoder_layers=6,
                  num_unicoder_layers=0,
                  num_decoder_layers=6,
-                 dim_feedforward=2048, dropout=0.0,
-                 activation="relu", normalize_before=False,
-                 return_intermediate_dec=False, query_dim=4,
+                 dim_feedforward=2048,
+                 dropout=0.0,
+                 activation="relu",
+                 query_dim=4,
                  num_patterns=0,
-                 modulate_hw_attn=False,
                  # for deformable encoder
-                 deformable_encoder=False,
-                 deformable_decoder=False,
                  num_feature_levels=1,
                  enc_n_points=4,
                  dec_n_points=4,
                  use_deformable_box_attn=False,
                  box_attn_type='roi_align',
                  # init query
-                 learnable_tgt_init=False,
                  decoder_query_perturber=None,
                  add_channel_attention=False,
-                 add_pos_value=False,
                  random_refpoints_xy=False,
                  # two stage
-                 two_stage_type='no',  # ['no', 'standard', 'early', 'combine', 'enceachlayer', 'enclayer1']
-                 two_stage_pat_embed=0,
-                 two_stage_add_query_num=0,
-                 two_stage_learn_wh=False,
+                 two_stage_type='standard',
                  two_stage_keep_all_tokens=False,
                  # evo of #anchors
-                 dec_layer_number=None,
-                 rm_enc_query_scale=True,
                  rm_dec_query_scale=True,
-                 rm_self_attn_layers=None,
-                 key_aware_type=None,
-                 # layer share
-                 layer_share_type=None,
                  # for detach
-                 rm_detach=None,
                  decoder_sa_type='ca',
                  module_seq=['sa', 'ca', 'ffn'],
                  # for dn
-                 embed_init_tgt=False,
-
                  use_detached_boxes_dec_out=False,
                  ):
         super().__init__()
-        self.num_feature_levels = num_feature_levels
-        self.num_encoder_layers = num_encoder_layers
-        self.num_unicoder_layers = num_unicoder_layers
-        self.num_decoder_layers = num_decoder_layers
-        self.deformable_encoder = deformable_encoder
-        self.deformable_decoder = deformable_decoder
-        self.two_stage_keep_all_tokens = two_stage_keep_all_tokens
-        self.num_queries = num_queries
-        self.random_refpoints_xy = random_refpoints_xy
-        self.use_detached_boxes_dec_out = use_detached_boxes_dec_out
-        assert query_dim == 4
 
-        if num_feature_levels > 1:
-            assert deformable_encoder, "only support deformable_encoder for num_feature_levels > 1"
-        if use_deformable_box_attn:
-            assert deformable_encoder or deformable_encoder
-
-        assert layer_share_type in [None, 'encoder', 'decoder', 'both']
-        if layer_share_type in ['encoder', 'both']:
-            enc_layer_share = True
-        else:
-            enc_layer_share = False
-        if layer_share_type in ['decoder', 'both']:
-            dec_layer_share = True
-        else:
-            dec_layer_share = False
-        assert layer_share_type is None
-
-        self.decoder_sa_type = decoder_sa_type
-        assert decoder_sa_type in ['sa', 'ca_label', 'ca_content']
-
-        # choose encoder layer type
         """
         d_model: 编码器里面mlp（前馈神经网络  2个linear层）的hidden dim 512
         nhead: 多头注意力头数 8
@@ -113,143 +66,94 @@ class DeformableTransformer(nn.Module):
         dim_feedforward: 前馈神经网络的维度 2048
         dropout: 0.1
         activation: 激活函数类型 relu
-        normalize_before: 是否使用前置LN
         return_intermediate_dec: 是否返回decoder中间层结果  False
         """
-        # 初始化一个小encoder
-        if deformable_encoder:
-            encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
-                                                              dropout, activation,
-                                                              num_feature_levels, nhead, enc_n_points,
-                                                              add_channel_attention=add_channel_attention,
-                                                              use_deformable_box_attn=use_deformable_box_attn,
-                                                              box_attn_type=box_attn_type)
-        else:
-            raise NotImplementedError
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        # 初始化一个encoderLayer
+        encoder_layer = DeformableTransformerEncoderLayer(d_model,
+                                                          dim_feedforward,
+                                                          dropout,
+                                                          activation,
+                                                          num_feature_levels,
+                                                          nhead, enc_n_points,
+                                                          add_channel_attention=add_channel_attention,
+                                                          use_deformable_box_attn=use_deformable_box_attn,
+                                                          box_attn_type=box_attn_type)
         # 创建整个Encoder层  6个encoder层堆叠
         self.encoder = TransformerEncoder(
-            encoder_layer, num_encoder_layers,
-            encoder_norm, d_model=d_model,
+            encoder_layer,
+            num_encoder_layers,
+            None,
+            d_model=d_model,
             num_queries=num_queries,
-            deformable_encoder=deformable_encoder,
-            enc_layer_share=enc_layer_share,
-            two_stage_type=two_stage_type
+            deformable_encoder=True,
+            enc_layer_share=False,
         )
 
-        # choose decoder layer type
-        # 初始化一个小decoder
-        if deformable_decoder:
-            decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
-                                                              dropout, activation,
-                                                              num_feature_levels, nhead, dec_n_points,
-                                                              use_deformable_box_attn=use_deformable_box_attn,
-                                                              box_attn_type=box_attn_type,
-                                                              key_aware_type=key_aware_type,
-                                                              decoder_sa_type=decoder_sa_type,
-                                                              module_seq=module_seq)
-
-        else:
-            raise NotImplementedError
-
-        decoder_norm = nn.LayerNorm(d_model)
+        # 初始化一个decoderLayer
+        decoder_layer = DeformableTransformerDecoderLayer(d_model,
+                                                          dim_feedforward,
+                                                          dropout,
+                                                          activation,
+                                                          num_feature_levels,
+                                                          nhead, dec_n_points,
+                                                          use_deformable_box_attn=use_deformable_box_attn,
+                                                          box_attn_type=box_attn_type,
+                                                          key_aware_type=None,
+                                                          decoder_sa_type=decoder_sa_type,
+                                                          module_seq=module_seq)
         # 创建整个Decoder层  6个decoder层堆叠
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec,
-                                          d_model=d_model, query_dim=query_dim,
-                                          modulate_hw_attn=modulate_hw_attn,
+        self.decoder = TransformerDecoder(decoder_layer,
+                                          num_decoder_layers,
+                                          nn.LayerNorm(d_model),
+                                          return_intermediate=True,
+                                          d_model=d_model,
+                                          query_dim=query_dim,
+                                          modulate_hw_attn=True,
                                           num_feature_levels=num_feature_levels,
-                                          deformable_decoder=deformable_decoder,
+                                          deformable_decoder=True,
                                           decoder_query_perturber=decoder_query_perturber,
-                                          dec_layer_number=dec_layer_number, rm_dec_query_scale=rm_dec_query_scale,
-                                          dec_layer_share=dec_layer_share,
+                                          dec_layer_number=None,
+                                          rm_dec_query_scale=rm_dec_query_scale,
+                                          dec_layer_share=False,
                                           use_detached_boxes_dec_out=use_detached_boxes_dec_out
                                           )
 
+        self.num_feature_levels = num_feature_levels
+        self.num_encoder_layers = num_encoder_layers
+        self.num_unicoder_layers = num_unicoder_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.two_stage_keep_all_tokens = two_stage_keep_all_tokens
+        self.num_queries = num_queries
+        self.random_refpoints_xy = random_refpoints_xy
+        self.use_detached_boxes_dec_out = use_detached_boxes_dec_out
+        self.decoder_sa_type = decoder_sa_type
         self.d_model = d_model  # 编码器里面mlp的hidden dim 512
         self.nhead = nhead  # 多头注意力头数 8
         self.dec_layers = num_decoder_layers
         self.num_queries = num_queries  # useful for single stage model only
         self.num_patterns = num_patterns
-        if not isinstance(num_patterns, int):
-            Warning("num_patterns should be int but {}".format(type(num_patterns)))
-            self.num_patterns = 0
-
+        self.two_stage_type = two_stage_type
         # scale-level position embedding  [4, 256]
         # 因为deformable detr用到了多尺度特征  经过backbone会生成4个不同尺度的特征图  但是如果还是使用原先的sine position embedding
         # detr是针对h和w进行编码的 不同位置的特征点会对应不同的编码值 但是deformable detr不同的特征图的不同位置就有可能会产生相同的位置编码，就无法区分了
         # 为了解决这个问题，这里引入level_embed这个遍历  不同层的特征图会有不同的level_embed 再让原先的每层位置编码+每层的level_embed
         # 这样就很好的区分不同层的位置编码了  而且这个level_embed是可学习的
-        if num_feature_levels > 1:
-            if self.num_encoder_layers > 0:
-                self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
-            else:
-                self.level_embed = None
+        self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
+        self.tgt_embed = nn.Embedding(self.num_queries, d_model)
+        nn.init.normal_(self.tgt_embed.weight.data)
 
-        self.learnable_tgt_init = learnable_tgt_init
-        assert learnable_tgt_init, "why not learnable_tgt_init"
-        self.embed_init_tgt = embed_init_tgt
-        if (two_stage_type != 'no' and embed_init_tgt) or (two_stage_type == 'no'):
-            self.tgt_embed = nn.Embedding(self.num_queries, d_model)
-            nn.init.normal_(self.tgt_embed.weight.data)
-        else:
-            self.tgt_embed = None
-
-        # for two stage
-        self.two_stage_type = two_stage_type
-        self.two_stage_pat_embed = two_stage_pat_embed
-        self.two_stage_add_query_num = two_stage_add_query_num
-        self.two_stage_learn_wh = two_stage_learn_wh
-        assert two_stage_type in ['no', 'standard'], "unknown param {} of two_stage_type".format(two_stage_type)
-        if two_stage_type == 'standard':
-            # anchor selection at the output of encoder
-            # 对Encoder输出memory进行处理：全连接层 + 层归一化
-            self.enc_output = nn.Linear(d_model, d_model)
-            self.enc_output_norm = nn.LayerNorm(d_model)
-
-            if two_stage_pat_embed > 0:
-                self.pat_embed_for_2stage = nn.Parameter(torch.Tensor(two_stage_pat_embed, d_model))
-                nn.init.normal_(self.pat_embed_for_2stage)
-
-            if two_stage_add_query_num > 0:
-                self.tgt_embed = nn.Embedding(self.two_stage_add_query_num, d_model)
-
-            if two_stage_learn_wh:
-
-                self.two_stage_wh_embedding = nn.Embedding(1, 2)
-            else:
-                self.two_stage_wh_embedding = None
-
-        if two_stage_type == 'no':
-            self.init_ref_points(num_queries)  # init self.refpoint_embed
-
-        self.enc_out_class_embed = None
-        self.enc_out_bbox_embed = None
+        # anchor selection at the output of encoder
+        # 对Encoder输出memory进行处理：全连接层 + 层归一化
+        self.enc_output = nn.Linear(d_model, d_model)
+        self.enc_output_norm = nn.LayerNorm(d_model)
 
         # evolution of anchors
-        self.dec_layer_number = dec_layer_number
-        if dec_layer_number is not None:
-            if self.two_stage_type != 'no' or num_patterns == 0:
-                assert dec_layer_number[
-                           0] == num_queries, f"dec_layer_number[0]({dec_layer_number[0]}) != num_queries({num_queries})"
-            else:
-                assert dec_layer_number[
-                           0] == num_queries * num_patterns, f"dec_layer_number[0]({dec_layer_number[0]}) != num_queries({num_queries}) * num_patterns({num_patterns})"
-
         self._reset_parameters()
-
-        self.rm_self_attn_layers = rm_self_attn_layers
-        if rm_self_attn_layers is not None:
-            print("Removing the self-attn in {} decoder layers".format(rm_self_attn_layers))
-            for lid, dec_layer in enumerate(self.decoder.layers):
-                if lid in rm_self_attn_layers:
-                    dec_layer.rm_self_attn_modules()
-
-        self.rm_detach = rm_detach
-        if self.rm_detach:
-            assert isinstance(rm_detach, list)
-            assert any([i in ['enc_ref', 'enc_tgt', 'dec'] for i in rm_detach])
-        self.decoder.rm_detach = rm_detach
+        # 外部定义 init_ref_points
+        self.refpoint_embed = None
+        # 外部定义 DINO
+        self.enc_out_class_embed = None
+        self.enc_out_bbox_embed = None
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -260,9 +164,6 @@ class DeformableTransformer(nn.Module):
                 m._reset_parameters()
         if self.num_feature_levels > 1 and self.level_embed is not None:
             nn.init.normal_(self.level_embed)
-
-        if self.two_stage_learn_wh:
-            nn.init.constant_(self.two_stage_wh_embedding.weight, math.log(0.05 / (1 - 0.05)))
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -276,13 +177,13 @@ class DeformableTransformer(nn.Module):
     def init_ref_points(self, use_num_queries):
         # 参考anchor detr, 类似于Anchor的作用
         self.refpoint_embed = nn.Embedding(use_num_queries, 4)
-
         if self.random_refpoints_xy:
             self.refpoint_embed.weight.data[:, :2].uniform_(0, 1)  # 在0-1之间随机生成
             self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])  # 反归一化
             self.refpoint_embed.weight.data[:, :2].requires_grad = False  # 不进行梯度计算
 
-    def forward(self, srcs, masks, refpoint_embed, pos_embeds, tgt, attn_mask=None, yolo_ref_points=None):
+    def forward(self, multi_level_feats, multi_level_masks, multi_level_pos_embeds, refpoint_embed, tgt, attn_mask=None,
+                yolo_ref_points=None):
         """
         Input:num_dn/ d_model =? hidden_dim
             - srcs: List of multi features [batch_size, channel, height, width]
@@ -300,13 +201,12 @@ class DeformableTransformer(nn.Module):
             - tgt: 新增去噪任务与推理任务的标签Embedding [batch_size, num_queries, d_model]. 仅在训练中存在
             - attn_mask: 新增去噪任务与推理任务的遮罩, 防止偷看其他数据 [query_num + dn_number * 2, query_num + dn_number * 2] 仅在训练任务中存在
         """
-        # prepare input for encoder
         # 准备encoder的输入参数
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
         spatial_shapes = []
-        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
+        for lvl, (src, mask, pos_embed) in enumerate(zip(multi_level_feats, multi_level_masks, multi_level_pos_embeds)):
             bs, c, h, w = src.shape  # batch_size channel h w
             spatial_shape = (h, w)  # 特征图shape
             spatial_shapes.append(spatial_shape)
@@ -337,24 +237,21 @@ class DeformableTransformer(nn.Module):
         # 不同尺度特征图对应被flatten的那个维度的起始索引  Tensor[4]  如[0,15100,18900,19850]
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         # 各尺度特征图中非padding部分的边长占其边长的比例  [bs, 4, 2]  如全是1
-        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
-
-        # two stage
-        enc_topk_proposals = enc_refpoint_embed = None
-
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
         #########################################################
         # Begin Encoder
         #########################################################
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
-        memory, enc_intermediate_output, enc_intermediate_refpoints = self.encoder(
-            src_flatten,
-            pos=lvl_pos_embed_flatten,
-            level_start_index=level_start_index,
+
+        memory = self.encoder(
+            query=src_flatten,
+            key=None,
+            value=None,
+            query_pos=lvl_pos_embed_flatten,
+            query_key_padding_mask=mask_flatten,
             spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
             valid_ratios=valid_ratios,
-            key_padding_mask=mask_flatten,
-            ref_token_index=enc_topk_proposals,  # bs, nq
-            ref_token_coord=enc_refpoint_embed,  # bs, nq, 4
         )
         #########################################################
         # End Encoder
@@ -372,11 +269,8 @@ class DeformableTransformer(nn.Module):
 
         '''处理encoder输出结果'''
 
-        if self.two_stage_type == 'standard':  # 默认使用二阶段,two_stage_type = standard
-            if self.two_stage_learn_wh:  # 默认不进入, two_stage_learn_wh = None
-                input_hw = self.two_stage_wh_embedding.weight[0]
-            else:  # 默认进入
-                input_hw = None
+        if 'standard' == 'standard':  # 默认使用二阶段,two_stage_type = standard
+            input_hw = None
             # (bs, \sum{hw}, c)
             # 对memory进行处理得到output_memory: [bs, H/8 * W/8 + ... + H/64 * W/64, 256]
             # 并生成初步output_proposals: [bs, H/8 * W/8 + ... + H/64 * W/64, 4]  其实就是特征图上的一个个的点坐标
@@ -384,18 +278,6 @@ class DeformableTransformer(nn.Module):
                                                                            input_hw)
             # 对encoder输出进行处理：全连接层 + LayerNorm
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
-            if self.two_stage_pat_embed > 0:  # 默认不进入
-                bs, nhw, _ = output_memory.shape
-                # output_memory: bs, n, 256; self.pat_embed_for_2stage: k, 256
-                output_memory = output_memory.repeat(1, self.two_stage_pat_embed, 1)
-                _pats = self.pat_embed_for_2stage.repeat_interleave(nhw, 0)
-                output_memory = output_memory + _pats
-                output_proposals = output_proposals.repeat(1, self.two_stage_pat_embed, 1)
-
-            if self.two_stage_add_query_num > 0:  # 默认不进入
-                assert refpoint_embed is not None
-                output_memory = torch.cat((output_memory, tgt), dim=1)
-                output_proposals = torch.cat((output_proposals, refpoint_embed), dim=1)
 
             # hack implementation for two-stage Deformable DETR
             # 多分类：[bs, H/8 * W/8 + ... + H/64 * W/64, 256] -> [bs, H/8 * W/8 + ... + H/64 * W/64, 91]
@@ -424,10 +306,7 @@ class DeformableTransformer(nn.Module):
 
             # gather tgt  # 根据前九百个位置获取query
             tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
-            if self.embed_init_tgt:  # 默认进入  # 如果已经初始化了tgt_embed
-                tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
-            else:  # 默认不进入
-                tgt_ = tgt_undetach.detach()
+            tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
 
             if refpoint_embed is not None:  # 训练时进入
                 refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_],
@@ -436,7 +315,7 @@ class DeformableTransformer(nn.Module):
             else:  # 默认不进入
                 refpoint_embed, tgt = refpoint_embed_, tgt_
 
-        elif self.two_stage_type == 'no':  # 默认不进入,推理时进入
+        elif 'standard' == 'no':  # 默认不进入,推理时进入
             tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
             refpoint_embed_ = self.refpoint_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, 4
 
@@ -458,7 +337,7 @@ class DeformableTransformer(nn.Module):
             init_box_proposal = refpoint_embed_.sigmoid()
 
         else:  # 默认不进入
-            raise NotImplementedError("unknown two_stage_type {}".format(self.two_stage_type))
+            raise NotImplementedError("unknown two_stage_type {}".format('standard'))
 
         # 设置yolo参考点
         if yolo_ref_points is not None:
@@ -510,7 +389,7 @@ class DeformableTransformer(nn.Module):
         #########################################################
         # Begin postprocess
         #########################################################     
-        if self.two_stage_type == 'standard':  # 默认进入
+        if 'standard' == 'standard':  # 默认进入
             if self.two_stage_keep_all_tokens:  # 默认不进入
                 hs_enc = output_memory.unsqueeze(0)
                 ref_enc = enc_outputs_coord_unselected.unsqueeze(0)
@@ -541,11 +420,15 @@ class DeformableTransformer(nn.Module):
 
 class TransformerEncoder(nn.Module):
 
-    def __init__(self, encoder_layer, num_layers, norm=None, d_model=256,
+    def __init__(self,
+                 encoder_layer,
+                 num_layers,
+                 norm=None,
+                 d_model=256,
                  num_queries=300,
                  deformable_encoder=False,
-                 enc_layer_share=False, enc_layer_dropout_prob=None,
-                 two_stage_type='no',  # ['no', 'standard', 'early', 'combine', 'enceachlayer', 'enclayer1']
+                 enc_layer_share=False,
+                 enc_layer_dropout_prob=None,
                  ):
         super().__init__()
         # prepare layers
@@ -570,16 +453,7 @@ class TransformerEncoder(nn.Module):
             for i in enc_layer_dropout_prob:
                 assert 0.0 <= i <= 1.0
 
-        self.two_stage_type = two_stage_type
-        if two_stage_type in ['enceachlayer', 'enclayer1']:
-            _proj_layer = nn.Linear(d_model, d_model)
-            _norm_layer = nn.LayerNorm(d_model)
-            if two_stage_type == 'enclayer1':
-                self.enc_norm = nn.ModuleList([_norm_layer])
-                self.enc_proj = nn.ModuleList([_proj_layer])
-            else:
-                self.enc_norm = nn.ModuleList([copy.deepcopy(_norm_layer) for i in range(num_layers - 1)])
-                self.enc_proj = nn.ModuleList([copy.deepcopy(_proj_layer) for i in range(num_layers - 1)])
+        self.two_stage_type = "standard"
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -617,14 +491,14 @@ class TransformerEncoder(nn.Module):
         return reference_points
 
     def forward(self,
-                src: Tensor,
-                pos: Tensor,
+                query: Tensor,
+                key: Tensor,
+                value: Tensor,
+                query_pos: Tensor,
+                query_key_padding_mask: Tensor,
                 spatial_shapes: Tensor,
                 level_start_index: Tensor,
                 valid_ratios: Tensor,
-                key_padding_mask: Tensor,
-                ref_token_index: Optional[Tensor] = None,
-                ref_token_coord: Optional[Tensor] = None
                 ):
         """
         Input:
@@ -635,7 +509,6 @@ class TransformerEncoder(nn.Module):
             - valid_ratios: [bs, num_level, 2]
             - key_padding_mask: [bs, sum(hi*wi)]
 
-            - ref_token_index: bs, nq
             - ref_token_coord: bs, nq, 4
         Intermedia:
             - reference_points: [bs, sum(hi*wi), num_level, 2]
@@ -650,23 +523,11 @@ class TransformerEncoder(nn.Module):
         pos: 4个flatten后特征图对应的位置编码（多尺度位置编码） [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         padding_mask: 4个flatten后特征图的mask [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64]
         """
-        if self.two_stage_type in ['no', 'standard', 'enceachlayer', 'enclayer1']:
-            assert ref_token_index is None
 
-        output = src
+        output = query
         # preparation and reshape
         # 4个flatten后特征图的归一化参考点坐标 每个特征点有4个参考点 xy坐标 [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
-        if self.num_layers > 0:
-            if self.deformable_encoder:
-                reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
-
-        # 未进入, 无效参数 默认ref_token_index=None
-        intermediate_output = []
-        intermediate_ref = []
-        if ref_token_index is not None:
-            out_i = torch.gather(output, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, self.d_model))
-            intermediate_output.append(out_i)
-            intermediate_ref.append(ref_token_coord)
+        reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=query.device)
 
         # main process
         for layer_id, layer in enumerate(self.layers):
@@ -676,47 +537,18 @@ class TransformerEncoder(nn.Module):
                 prob = random.random()
                 if prob < self.enc_layer_dropout_prob[layer_id]:
                     dropflag = True
-
             if not dropflag:  # 一定进入
                 if self.deformable_encoder:  # 一定使用deformable_encoder 默认为True
-                    output = layer(src=output, pos=pos, reference_points=reference_points,
+                    output = layer(src=output, pos=query_pos, reference_points=reference_points,
                                    spatial_shapes=spatial_shapes, level_start_index=level_start_index,
-                                   key_padding_mask=key_padding_mask)
+                                   key_padding_mask=query_key_padding_mask)
                 else:  # 应该不会适应普通encoder 一般不会进入
-                    output = layer(src=output.transpose(0, 1), pos=pos.transpose(0, 1),
-                                   key_padding_mask=key_padding_mask).transpose(0, 1)
+                    output = layer(src=output.transpose(0, 1), pos=query_pos.transpose(0, 1),
+                                   key_padding_mask=query_key_padding_mask).transpose(0, 1)
 
-            if ((layer_id == 0 and self.two_stage_type in ['enceachlayer', 'enclayer1']) \
-                or (self.two_stage_type == 'enceachlayer')) \
-                    and (layer_id != self.num_layers - 1):  # 默认不会进入,默认two_stage_type = standard
-                output_memory, output_proposals = gen_encoder_output_proposals(output, key_padding_mask, spatial_shapes)
-                output_memory = self.enc_norm[layer_id](self.enc_proj[layer_id](output_memory))
-
-                # gather boxes
-                topk = self.num_queries
-                enc_outputs_class = self.class_embed[layer_id](output_memory)
-                ref_token_index = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1]  # bs, nq
-                ref_token_coord = torch.gather(output_proposals, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, 4))
-
-                output = output_memory
-
-            # aux loss
-            if (layer_id != self.num_layers - 1) and ref_token_index is not None:  # 默认不会进入,因为ref_token_index一定为None
-                out_i = torch.gather(output, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, self.d_model))
-                intermediate_output.append(out_i)
-                intermediate_ref.append(ref_token_coord)
-
-        if self.norm is not None:  # 不会进入,默认norm=None
-            output = self.norm(output)
-
-        if ref_token_index is not None:  # 不会进入, 默认ref_token_index=None
-            intermediate_output = torch.stack(intermediate_output)  # n_enc/n_enc-1, bs, \sum{hw}, d_model
-            intermediate_ref = torch.stack(intermediate_ref)
-        else:  # 默认进入
-            intermediate_output = intermediate_ref = None  # 默认为空,无意义参数
         # 经过6层encoder增强后的新特征  每一层不断学习特征层中每个位置和4个采样点的相关性，最终输出的特征是增强后的特征图
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
-        return output, intermediate_output, intermediate_ref  # output = query,其余为无意义参数
+        return output
 
 
 class TransformerDecoder(nn.Module):
@@ -786,8 +618,6 @@ class TransformerDecoder(nn.Module):
             assert len(dec_layer_dropout_prob) == num_layers
             for i in dec_layer_dropout_prob:
                 assert 0.0 <= i <= 1.0
-
-        self.rm_detach = None
 
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
@@ -914,7 +744,7 @@ class TransformerDecoder(nn.Module):
                         new_reference_points = torch.gather(new_reference_points, 0,
                                                             topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
 
-                if self.rm_detach and 'dec' in self.rm_detach:  # 默认不进入
+                if None and 'dec' in None:  # 默认不进入
                     reference_points = new_reference_points
                 else:  # 默认进入,更新参考点
                     reference_points = new_reference_points.detach()
@@ -1220,8 +1050,6 @@ def build_deformable_transformer(args):
         decoder_query_perturber = RandomBoxPerturber(
             x_noise_scale=args.dln_xy_noise, y_noise_scale=args.dln_xy_noise,
             w_noise_scale=args.dln_hw_noise, h_noise_scale=args.dln_hw_noise)
-
-    use_detached_boxes_dec_out = False
     try:
         use_detached_boxes_dec_out = args.use_detached_boxes_dec_out
     except:
@@ -1236,43 +1064,21 @@ def build_deformable_transformer(args):
         num_encoder_layers=args.enc_layers,
         num_unicoder_layers=args.unic_layers,
         num_decoder_layers=args.dec_layers,
-        normalize_before=args.pre_norm,
-        return_intermediate_dec=True,
         query_dim=args.query_dim,
         activation=args.transformer_activation,
         num_patterns=args.num_patterns,
-        modulate_hw_attn=True,
-
-        deformable_encoder=True,
-        deformable_decoder=True,
         num_feature_levels=args.num_feature_levels,
         enc_n_points=args.enc_n_points,
         dec_n_points=args.dec_n_points,
         use_deformable_box_attn=args.use_deformable_box_attn,
         box_attn_type=args.box_attn_type,
-
-        learnable_tgt_init=True,
         decoder_query_perturber=decoder_query_perturber,
-
         add_channel_attention=args.add_channel_attention,
-        add_pos_value=args.add_pos_value,
         random_refpoints_xy=args.random_refpoints_xy,
-
         # two stage
-        two_stage_type=args.two_stage_type,  # ['no', 'standard', 'early']
-        two_stage_pat_embed=args.two_stage_pat_embed,
-        two_stage_add_query_num=args.two_stage_add_query_num,
-        two_stage_learn_wh=args.two_stage_learn_wh,
+        two_stage_type=args.two_stage_type,
         two_stage_keep_all_tokens=args.two_stage_keep_all_tokens,
-        dec_layer_number=args.dec_layer_number,
-        rm_self_attn_layers=None,
-        key_aware_type=None,
-        layer_share_type=None,
-
-        rm_detach=None,
         decoder_sa_type=args.decoder_sa_type,
         module_seq=args.decoder_module_seq,
-
-        embed_init_tgt=args.embed_init_tgt,
         use_detached_boxes_dec_out=use_detached_boxes_dec_out
     )

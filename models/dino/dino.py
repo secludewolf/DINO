@@ -361,9 +361,10 @@ class DINO(nn.Module):
             assert targets is None
             input_query_bbox = input_query_label = attn_mask = dn_meta = None
 
-        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs, masks,
-                                                                             input_query_bbox,
+        hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(srcs,
+                                                                             masks,
                                                                              poss,
+                                                                             input_query_bbox,
                                                                              input_query_label,
                                                                              attn_mask,
                                                                              yolo_ref_points)
