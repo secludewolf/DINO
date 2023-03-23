@@ -42,13 +42,10 @@ class DeformableTransformer(nn.Module):
                  activation="relu",
                  query_dim=4,
                  num_patterns=0,
-                 # for deformable encoder
                  num_feature_levels=1,
                  enc_n_points=4,
                  dec_n_points=4,
-                 # init query
                  random_refpoints_xy=False,
-                 # for detach
                  module_seq=None):
         super().__init__()
         """

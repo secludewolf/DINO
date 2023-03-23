@@ -40,6 +40,7 @@ from .utils import sigmoid_focal_loss, MLP
 from ..registry import MODULE_BUILD_FUNCS
 
 
+# noinspection PyUnboundLocalVariable
 class DINO(nn.Module):
     """ This is the Cross-Attention Detector module that performs object detection """
 
@@ -56,7 +57,6 @@ class DINO(nn.Module):
                  fix_refpoints_hw=-1,
                  num_feature_levels=1,
                  nheads=8,
-                 # two stage
                  two_stage_type='no',  # ['no', 'standard']
                  decoder_sa_type='sa',
                  num_patterns=0,
@@ -453,6 +453,7 @@ def loss_masks(outputs, targets, indices, num_boxes):
     return losses
 
 
+# noinspection PyUnresolvedReferences
 class SetCriterion(nn.Module):
     """ This class computes the loss for Conditional DETR.
     The process happens in two steps:
@@ -541,6 +542,7 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
+    # noinspection PyUnboundLocalVariable
     def forward(self, outputs, targets, return_indices=False):
         """
         This performs the loss computation.
@@ -859,8 +861,7 @@ def build_dino(args):
 
     # prepare weight dict
     # 损失权重
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef}
     clean_weight_dict_wo_dn = copy.deepcopy(weight_dict)
 
     # for DN training
