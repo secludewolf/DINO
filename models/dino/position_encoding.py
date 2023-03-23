@@ -90,6 +90,7 @@ class PositionEmbeddingSine(nn.Module):
         # [bs,256,19,26]  dim=1时  前128个是y方向位置编码  后128个是x方向位置编码
         return pos
 
+
 class PositionEmbeddingSineHW(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -115,8 +116,6 @@ class PositionEmbeddingSineHW(nn.Module):
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
         x_embed = not_mask.cumsum(2, dtype=torch.float32)
 
-
-
         if self.normalize:
             eps = 1e-6
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
@@ -134,9 +133,8 @@ class PositionEmbeddingSineHW(nn.Module):
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
 
-
-
         return pos
+
 
 class PositionEmbeddingLearned(nn.Module):
     """
@@ -180,13 +178,13 @@ def build_position_encoding(args):
     创建位置编码
     args: 一系列参数  args.hidden_dim: transformer中隐藏层的维度   args.position_embedding: 位置编码类型 正余弦sine or 可学习learned
     """
-    # N_steps = 128 = 256 // 2  backbone输出[bs,256,25,34]  256维度的特征
+    # N_steps = 128 = 256 // 2  backbone输出[bs,256,H,W]  256维度的特征
     # 而传统的位置编码应该也是256维度的, 但是detr用的是一个x方向和y方向的位置编码concat的位置编码方式  这里和ViT有所不同
     # 二维位置编码   前128维代表x方向位置编码  后128维代表y方向位置编码
     N_steps = args.hidden_dim // 2
     if args.position_embedding in ('v2', 'sine'):
         # 余弦编码方式
-        # [bs,256,19,26]  dim=1时  前128个是y方向位置编码  后128个是x方向位置编码
+        # [bs,256,H,W]  dim=1时  前128个是y方向位置编码  后128个是x方向位置编码
         position_embedding = PositionEmbeddingSineHW(
             N_steps, 
             temperatureH=args.pe_temperatureH,
