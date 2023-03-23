@@ -58,11 +58,6 @@ class DINO(nn.Module):
                  nheads=8,
                  # two stage
                  two_stage_type='no',  # ['no', 'standard']
-                 two_stage_add_query_num=0,
-                 dec_pred_class_embed_share=True,
-                 dec_pred_bbox_embed_share=True,
-                 two_stage_class_embed_share=True,
-                 two_stage_bbox_embed_share=True,
                  decoder_sa_type='sa',
                  num_patterns=0,
                  dn_number=100,
@@ -70,7 +65,7 @@ class DINO(nn.Module):
                  dn_label_noise_ratio=0.5,
                  dn_labelbook_size=100,
                  ):
-        """ Initializes the model.
+        r""" Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
             transformer: torch module of the transformer architecture. See transformer.py
@@ -89,7 +84,8 @@ class DINO(nn.Module):
         self.transformer = transformer
         self.model_yolo = DetectMultiBackend("C:\BaiduSyncdisk\WorkSpace\Python\yolov5\ip102_best.pt")
 
-        # prepare input projection layers
+        # TODO 抽离成为Neck层 抽离后预训练模型将无法加载
+        # 准备投影层, 将通道数高于256的特征投影至256通道. backbone->降维->transformer
         # 3个1x1conv + 1个3x3conv
         num_backbone_outs = len(backbone.num_channels)
         input_proj_list = []
@@ -131,11 +127,7 @@ class DINO(nn.Module):
         self.aux_loss = aux_loss  # True 计算辅助损失  6个decoder总损失
 
         self.iter_update = iter_update
-        assert iter_update, "Why not iter_update?"
 
-        # prepare pred layers
-        self.dec_pred_class_embed_share = dec_pred_class_embed_share
-        self.dec_pred_bbox_embed_share = dec_pred_bbox_embed_share
         # prepare class & box embed
         _class_embed = nn.Linear(hidden_dim, num_classes)
         _bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -146,15 +138,8 @@ class DINO(nn.Module):
         _class_embed.bias.data = torch.ones(self.num_classes) * bias_value
         nn.init.constant_(_bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)
-
-        if dec_pred_bbox_embed_share:
-            box_embed_layerlist = [_bbox_embed for _ in range(transformer.num_decoder_layers)]
-        else:
-            box_embed_layerlist = [copy.deepcopy(_bbox_embed) for _ in range(transformer.num_decoder_layers)]
-        if dec_pred_class_embed_share:
-            class_embed_layerlist = [_class_embed for _ in range(transformer.num_decoder_layers)]
-        else:
-            class_embed_layerlist = [copy.deepcopy(_class_embed) for _ in range(transformer.num_decoder_layers)]
+        box_embed_layerlist = [_bbox_embed for _ in range(transformer.num_decoder_layers)]
+        class_embed_layerlist = [_class_embed for _ in range(transformer.num_decoder_layers)]
         # 回归
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         # 分类
@@ -164,36 +149,14 @@ class DINO(nn.Module):
 
         # two stage
         self.two_stage_type = two_stage_type
-        self.two_stage_add_query_num = two_stage_add_query_num
-        assert two_stage_type in ['no', 'standard'], "unknown param {} of two_stage_type".format(two_stage_type)
-        if two_stage_type != 'no':
-            if two_stage_bbox_embed_share:
-                assert dec_pred_class_embed_share and dec_pred_bbox_embed_share
-                self.transformer.enc_out_bbox_embed = _bbox_embed
-            else:
-                self.transformer.enc_out_bbox_embed = copy.deepcopy(_bbox_embed)
 
-            if two_stage_class_embed_share:
-                assert dec_pred_class_embed_share and dec_pred_bbox_embed_share
-                self.transformer.enc_out_class_embed = _class_embed
-            else:
-                self.transformer.enc_out_class_embed = copy.deepcopy(_class_embed)
-
-            self.refpoint_embed = None
-            if self.two_stage_add_query_num > 0:
-                self.init_ref_points(two_stage_add_query_num)
-
+        self.transformer.enc_out_bbox_embed = copy.deepcopy(_bbox_embed)
+        self.transformer.enc_out_class_embed = copy.deepcopy(_class_embed)
+        self.refpoint_embed = None
         self.decoder_sa_type = decoder_sa_type
-        assert decoder_sa_type in ['sa', 'ca_label', 'ca_content']
-        if decoder_sa_type == 'ca_label':
-            self.label_embedding = nn.Embedding(num_classes, hidden_dim)
-            for layer in self.transformer.decoder.layers:
-                layer.label_embedding = self.label_embedding
-        else:
-            for layer in self.transformer.decoder.layers:
-                layer.label_embedding = None
-            self.label_embedding = None
-
+        for layer in self.transformer.decoder.layers:
+            layer.label_embedding = None
+        self.label_embedding = None
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -228,21 +191,7 @@ class DINO(nn.Module):
             raise NotImplementedError('Unknown fix_refpoints_hw {}'.format(self.fix_refpoints_hw))
 
     def forward(self, samples: NestedTensor, targets: List = None):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
-
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x num_classes]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, width, height). These values are normalized in [0, 1],
-                               relative to the size of each individual image (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
-        """
-        """
+        r"""
             参数samples必须是NestedTensor类型的, 它包含:
                 - samples.tensor: 一个批量的图像 (batch_size, 3, H, W)
                 - samples.mask: 一个由0,1构成的tensor (batch_size, H, W) 当值为1是表明此像素是通过padding得到的无意义像素
@@ -260,7 +209,6 @@ class DINO(nn.Module):
                 - pred_boxes: 所有query的框坐标预测结果(X, Y, W, H) 这些值是被归一化的在[0, 1]之间
                 - aux_outputs: 可选,仅在辅助损耗激活时返回。这是一个列表. 字典包含每个解码器层的上述两个密钥
         """
-
         # 判断samples是否是NestedTensor类型,如果不是就转成NestedTensor类型
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -276,11 +224,9 @@ class DINO(nn.Module):
         features, poss = self.backbone(samples)
 
         # YOLO相关
-        # print(targets)
         self.model_yolo.eval()
         with torch.no_grad():
             t, h, w = reshape_tensor_32(samples.tensors)
-            # print(t.shape, h, w)
             pred = self.model_yolo(t)
             bs = samples.tensors.shape[0]
             yolo_ref_points = torch.zeros((bs, 100, 4))
@@ -317,6 +263,7 @@ class DINO(nn.Module):
 
         srcs = []
         masks = []
+        # TODO Neck层
         # 多尺度特征图降维,通道数降至256
         for l, feat in enumerate(features):
             src, mask = feat.decompose()
@@ -373,6 +320,7 @@ class DINO(nn.Module):
             layer_outputs_unsig = layer_outputs_unsig.sigmoid()
             outputs_coord_list.append(layer_outputs_unsig)
         outputs_coord_list = torch.stack(outputs_coord_list)
+
         # 回归结果 类别
         outputs_class = torch.stack([layer_cls_embed(layer_hs) for
                                      layer_cls_embed, layer_hs in zip(self.class_embed, hs)])
@@ -424,7 +372,7 @@ class DINO(nn.Module):
 
 def _get_src_permutation_idx(indices):
     # permute predictions following indices
-    # [num_all_gt]  记录每个gt都是来自哪张图片的 idx
+    # [num_all_gt]  记录每个预测都是来自哪张图片的 idx
     batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
     # 记录匹配到的预测框的idx
     src_idx = torch.cat([src for (src, _) in indices])
@@ -433,15 +381,17 @@ def _get_src_permutation_idx(indices):
 
 def _get_tgt_permutation_idx(indices):
     # permute targets following indices
+    # [num_all_gt]  记录每个gt都是来自哪张图片的 idx
     batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
     tgt_idx = torch.cat([tgt for (_, tgt) in indices])
     return batch_idx, tgt_idx
 
 
 def loss_boxes(outputs, targets, indices, num_boxes):
-    """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-       targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-       The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+    """
+    Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+    targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+    The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
     targets：'boxes'=[3,4] labels=[3] ...
     indices： [3] 如：5,35,63  匹配好的3个预测框idx
     num_boxes：当前batch的所有gt个数
@@ -527,10 +477,12 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (Binary focal loss)
+        """
+        Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
-        """Classification loss (NLL)
+        """
+        Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         outputs：'pred_logits'=[bs, 100, 92] 'pred_boxes'=[bs, 100, 4] 'aux_outputs'=5*([bs, 100, 92]+[bs, 100, 4])
         targets：'boxes'=[3,4] labels=[3] ...
@@ -566,7 +518,8 @@ class SetCriterion(nn.Module):
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+        """
+        Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
         pred_logits = outputs['pred_logits']
@@ -589,7 +542,8 @@ class SetCriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets, return_indices=False):
-        """ This performs the loss computation.
+        """
+        This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
@@ -769,7 +723,6 @@ class SetCriterion(nn.Module):
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
-
     def __init__(self, num_select=100, nms_iou_threshold=-1) -> None:
         super().__init__()
         self.num_select = num_select
@@ -777,7 +730,8 @@ class PostProcess(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes, not_to_xyxy=False, test=False):
-        """ Perform the computation
+        """
+        Perform the computation
         Parameters:
             outputs: raw outputs of the model
             target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
@@ -868,22 +822,11 @@ def build_dino(args):
     transformer = build_deformable_transformer(args)
 
     try:
-        match_unstable_error = args.match_unstable_error
         dn_labelbook_size = args.dn_labelbook_size
         if dn_labelbook_size < num_classes:
             dn_labelbook_size = num_classes
     except:
-        match_unstable_error = True
         dn_labelbook_size = num_classes
-
-    try:
-        dec_pred_class_embed_share = args.dec_pred_class_embed_share
-    except:
-        dec_pred_class_embed_share = True
-    try:
-        dec_pred_bbox_embed_share = args.dec_pred_bbox_embed_share
-    except:
-        dec_pred_bbox_embed_share = True
 
     # 搭建整个DINO模型
     model = DINO(
@@ -899,13 +842,7 @@ def build_dino(args):
         fix_refpoints_hw=args.fix_refpoints_hw,
         num_feature_levels=args.num_feature_levels,
         nheads=args.nheads,
-        dec_pred_class_embed_share=dec_pred_class_embed_share,
-        dec_pred_bbox_embed_share=dec_pred_bbox_embed_share,
-        # two stage
         two_stage_type=args.two_stage_type,
-        # box_share
-        two_stage_bbox_embed_share=args.two_stage_bbox_embed_share,
-        two_stage_class_embed_share=args.two_stage_class_embed_share,
         decoder_sa_type=args.decoder_sa_type,
         num_patterns=args.num_patterns,
         dn_number=args.dn_number if args.use_dn else 0,
