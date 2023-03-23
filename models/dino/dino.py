@@ -16,6 +16,7 @@
 import copy
 import math
 from typing import List
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -26,27 +27,30 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 from util.util_yolo import reshape_tensor_32
-from yolov5.utils.general import non_max_suppression, xyxy2xywh, xyxy2xywhn, xywhn2xyxy
-
+from yolov5.models.common import DetectMultiBackend
+from yolov5.utils.general import xyxy2xywhn, xywhn2xyxy
+from yolov5.utils.metrics import box_iou
 from .backbone import build_backbone
+from .deformable_transformer import build_deformable_transformer
+from .dn_components import prepare_for_cdn, dn_post_process
 from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss)
-from .deformable_transformer import build_deformable_transformer
 from .utils import sigmoid_focal_loss, MLP
-
 from ..registry import MODULE_BUILD_FUNCS
-from .dn_components import prepare_for_cdn, dn_post_process
-
-from yolov5.models.common import DetectMultiBackend
-from yolov5.utils.metrics import box_iou
 
 
 class DINO(nn.Module):
     """ This is the Cross-Attention Detector module that performs object detection """
 
-    def __init__(self, backbone, transformer, num_classes, num_queries,
-                 aux_loss=False, iter_update=False,
+    def __init__(self,
+                 backbone,
+                 transformer,
+                 hidden_dim,
+                 num_classes,
+                 num_queries,
+                 aux_loss=False,
+                 iter_update=False,
                  query_dim=2,
                  random_refpoints_xy=False,
                  fix_refpoints_hw=-1,
@@ -80,10 +84,33 @@ class DINO(nn.Module):
                                 -2 : learn a shared w and h
         """
         super().__init__()
-        self.num_queries = num_queries
+
+        self.backbone = backbone  # backbone Joiner  0 Backbone + 1 PositionEmbeddingSine
         self.transformer = transformer
+        self.model_yolo = DetectMultiBackend("C:\BaiduSyncdisk\WorkSpace\Python\yolov5\ip102_best.pt")
+
+        # prepare input projection layers
+        # 3个1x1conv + 1个3x3conv
+        num_backbone_outs = len(backbone.num_channels)
+        input_proj_list = []
+        for _ in range(num_backbone_outs):  # 3个1x1conv
+            in_channels = backbone.num_channels[_]  # 512  1024  2048
+            input_proj_list.append(nn.Sequential(  # conv1x1  -> 256 channel
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+                nn.GroupNorm(32, hidden_dim),
+            ))
+        for _ in range(num_feature_levels - num_backbone_outs):  # 1个3x3conv
+            input_proj_list.append(nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),  # 3x3conv s=2 -> 256channel
+                nn.GroupNorm(32, hidden_dim),
+            ))
+            in_channels = hidden_dim
+        # 用于降维
+        self.input_proj = nn.ModuleList(input_proj_list)
+
+        self.num_queries = num_queries
         self.num_classes = num_classes
-        self.hidden_dim = hidden_dim = transformer.d_model  # 256
+        self.hidden_dim = hidden_dim  # 256
         self.num_feature_levels = num_feature_levels
         self.nheads = nheads
         self.label_enc = nn.Embedding(dn_labelbook_size + 1, hidden_dim)
@@ -101,41 +128,7 @@ class DINO(nn.Module):
         self.dn_label_noise_ratio = dn_label_noise_ratio
         self.dn_labelbook_size = dn_labelbook_size
 
-        # YOLO模型
-        self.model_yolo = DetectMultiBackend("C:\BaiduSyncdisk\WorkSpace\Python\yolov5\ip102_best.pt")
-
-        # prepare input projection layers
-        # 3个1x1conv + 1个3x3conv
-        if num_feature_levels > 1:
-            num_backbone_outs = len(backbone.num_channels)
-            input_proj_list = []
-            for _ in range(num_backbone_outs):  # 3个1x1conv
-                in_channels = backbone.num_channels[_]  # 512  1024  2048
-                input_proj_list.append(nn.Sequential(  # conv1x1  -> 256 channel
-                    nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
-                    nn.GroupNorm(32, hidden_dim),
-                ))
-            for _ in range(num_feature_levels - num_backbone_outs):  # 1个3x3conv
-                input_proj_list.append(nn.Sequential(
-                    nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),  # 3x3conv s=2 -> 256channel
-                    nn.GroupNorm(32, hidden_dim),
-                ))
-                in_channels = hidden_dim
-            # 用于降维
-            self.input_proj = nn.ModuleList(input_proj_list)
-        else:
-            assert two_stage_type == 'no', "two_stage_type should be no if num_feature_levels=1 !!!"
-            # 用于多尺度特征降维
-            # 经过一个卷积 + GroupNorm，得到下采样率为64、将维到256的特征。
-            self.input_proj = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(backbone.num_channels[-1], hidden_dim, kernel_size=1),
-                    nn.GroupNorm(32, hidden_dim),
-                )])
-
-        self.backbone = backbone  # backbone Joiner  0 Backbone + 1 PositionEmbeddingSine
         self.aux_loss = aux_loss  # True 计算辅助损失  6个decoder总损失
-        self.box_pred_damping = box_pred_damping = None
 
         self.iter_update = iter_update
         assert iter_update, "Why not iter_update?"
@@ -155,13 +148,13 @@ class DINO(nn.Module):
         nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)
 
         if dec_pred_bbox_embed_share:
-            box_embed_layerlist = [_bbox_embed for i in range(transformer.num_decoder_layers)]
+            box_embed_layerlist = [_bbox_embed for _ in range(transformer.num_decoder_layers)]
         else:
-            box_embed_layerlist = [copy.deepcopy(_bbox_embed) for i in range(transformer.num_decoder_layers)]
+            box_embed_layerlist = [copy.deepcopy(_bbox_embed) for _ in range(transformer.num_decoder_layers)]
         if dec_pred_class_embed_share:
-            class_embed_layerlist = [_class_embed for i in range(transformer.num_decoder_layers)]
+            class_embed_layerlist = [_class_embed for _ in range(transformer.num_decoder_layers)]
         else:
-            class_embed_layerlist = [copy.deepcopy(_class_embed) for i in range(transformer.num_decoder_layers)]
+            class_embed_layerlist = [copy.deepcopy(_class_embed) for _ in range(transformer.num_decoder_layers)]
         # 回归
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         # 分类
@@ -231,7 +224,6 @@ class DINO(nn.Module):
             self.refpoint_embed.weight.data[:, :2].uniform_(0, 1)
             self.refpoint_embed.weight.data[:, :2] = inverse_sigmoid(self.refpoint_embed.weight.data[:, :2])
             self.refpoint_embed.weight.data[:, :2].requires_grad = False
-            self.hw_embed = nn.Embedding(1, 1)
         else:
             raise NotImplementedError('Unknown fix_refpoints_hw {}'.format(self.fix_refpoints_hw))
 
@@ -393,30 +385,29 @@ class DINO(nn.Module):
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord_list)
 
         # for encoder output
-        if hs_enc is not None:  # 默认进入
-            # prepare intermediate outputs
-            interm_coord = ref_enc[-1]  # 回归结果 边框
-            interm_class = self.transformer.enc_out_class_embed(hs_enc[-1])  # 回归结果 类别
-            out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
-            out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
+        # prepare intermediate outputs
+        interm_coord = ref_enc[-1]  # 回归结果 边框
+        interm_class = self.transformer.enc_out_class_embed(hs_enc[-1])  # 回归结果 类别
+        out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
+        out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
 
-            # prepare enc outputs
-            if hs_enc.shape[0] > 1:  # 默认不进入
-                enc_outputs_coord = []
-                enc_outputs_class = []
-                for layer_id, (layer_box_embed, layer_class_embed, layer_hs_enc, layer_ref_enc) in enumerate(
-                        zip(self.enc_bbox_embed, self.enc_class_embed, hs_enc[:-1], ref_enc[:-1])):
-                    layer_enc_delta_unsig = layer_box_embed(layer_hs_enc)
-                    layer_enc_outputs_coord_unsig = layer_enc_delta_unsig + inverse_sigmoid(layer_ref_enc)
-                    layer_enc_outputs_coord = layer_enc_outputs_coord_unsig.sigmoid()
+        # prepare enc outputs
+        if hs_enc.shape[0] > 1:  # 默认不进入
+            enc_outputs_coord = []
+            enc_outputs_class = []
+            for layer_id, (layer_box_embed, layer_class_embed, layer_hs_enc, layer_ref_enc) in enumerate(
+                    zip(self.enc_bbox_embed, self.enc_class_embed, hs_enc[:-1], ref_enc[:-1])):
+                layer_enc_delta_unsig = layer_box_embed(layer_hs_enc)
+                layer_enc_outputs_coord_unsig = layer_enc_delta_unsig + inverse_sigmoid(layer_ref_enc)
+                layer_enc_outputs_coord = layer_enc_outputs_coord_unsig.sigmoid()
 
-                    layer_enc_outputs_class = layer_class_embed(layer_hs_enc)
-                    enc_outputs_coord.append(layer_enc_outputs_coord)
-                    enc_outputs_class.append(layer_enc_outputs_class)
+                layer_enc_outputs_class = layer_class_embed(layer_hs_enc)
+                enc_outputs_coord.append(layer_enc_outputs_coord)
+                enc_outputs_class.append(layer_enc_outputs_class)
 
-                out['enc_outputs'] = [
-                    {'pred_logits': a, 'pred_boxes': b} for a, b in zip(enc_outputs_class, enc_outputs_coord)
-                ]
+            out['enc_outputs'] = [
+                {'pred_logits': a, 'pred_boxes': b} for a, b in zip(enc_outputs_class, enc_outputs_coord)
+            ]
 
         out['dn_meta'] = dn_meta
 
@@ -429,6 +420,88 @@ class DINO(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+
+def _get_src_permutation_idx(indices):
+    # permute predictions following indices
+    # [num_all_gt]  记录每个gt都是来自哪张图片的 idx
+    batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+    # 记录匹配到的预测框的idx
+    src_idx = torch.cat([src for (src, _) in indices])
+    return batch_idx, src_idx
+
+
+def _get_tgt_permutation_idx(indices):
+    # permute targets following indices
+    batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+    tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+    return batch_idx, tgt_idx
+
+
+def loss_boxes(outputs, targets, indices, num_boxes):
+    """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+       targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+       The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+    targets：'boxes'=[3,4] labels=[3] ...
+    indices： [3] 如：5,35,63  匹配好的3个预测框idx
+    num_boxes：当前batch的所有gt个数
+    """
+    assert 'pred_boxes' in outputs
+    # idx tuple:2  0=[num_all_gt] 记录每个gt属于哪张图片  1=[num_all_gt] 记录每个匹配到的预测框的index
+    idx = _get_src_permutation_idx(indices)
+    # [all_gt_num, 4]  这个batch的所有正样本的预测框坐标
+    src_boxes = outputs['pred_boxes'][idx]
+    # [all_gt_num, 4]  这个batch的所有gt框坐标
+    target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+    # 计算L1损失
+    loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+    losses = {'loss_bbox': loss_bbox.sum() / num_boxes}
+
+    # 计算GIOU损失
+    loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+        box_ops.box_cxcywh_to_xyxy(src_boxes),
+        box_ops.box_cxcywh_to_xyxy(target_boxes)))
+    losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+    # calculate the x,y and h,w loss
+    with torch.no_grad():
+        losses['loss_xy'] = loss_bbox[..., :2].sum() / num_boxes
+        losses['loss_hw'] = loss_bbox[..., 2:].sum() / num_boxes
+
+    # 'loss_bbox': L1回归损失   'loss_giou': giou回归损失
+    return losses
+
+
+def loss_masks(outputs, targets, indices, num_boxes):
+    """Compute the losses related to the masks: the focal loss and the dice loss.
+       targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
+    """
+    assert "pred_masks" in outputs
+
+    src_idx = _get_src_permutation_idx(indices)
+    tgt_idx = _get_tgt_permutation_idx(indices)
+    src_masks = outputs["pred_masks"]
+    src_masks = src_masks[src_idx]
+    masks = [t["masks"] for t in targets]
+    # TODO use valid to mask invalid areas due to padding in loss
+    target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
+    target_masks = target_masks.to(src_masks)
+    target_masks = target_masks[tgt_idx]
+
+    # upsample predictions to the target size
+    src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
+                            mode="bilinear", align_corners=False)
+    src_masks = src_masks[:, 0].flatten(1)
+
+    target_masks = target_masks.flatten(1)
+    target_masks = target_masks.view(src_masks.shape)
+    losses = {
+        "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
+        "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
+    }
+    return losses
 
 
 class SetCriterion(nn.Module):
@@ -449,9 +522,9 @@ class SetCriterion(nn.Module):
         """
         super().__init__()
         self.num_classes = num_classes  # 数据集类别数
-        self.matcher = matcher          # HungarianMatcher()  匈牙利算法 二分图匹配
+        self.matcher = matcher  # HungarianMatcher()  匈牙利算法 二分图匹配
         self.weight_dict = weight_dict  # dict: 18  3x6  6个decoder的损失权重   6*(loss_ce+loss_giou+loss_bbox)
-        self.losses = losses            # list: 3  ['labels', 'boxes', 'cardinality']
+        self.losses = losses  # list: 3  ['labels', 'boxes', 'cardinality']
         self.focal_alpha = focal_alpha
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
@@ -469,7 +542,7 @@ class SetCriterion(nn.Module):
         src_logits = outputs['pred_logits']  # 分类：[bs, 100, 92类别]
 
         # idx tuple:2  0=[num_all_gt] 记录每个gt属于哪张图片  1=[num_all_gt] 记录每个匹配到的预测框的index
-        idx = self._get_src_permutation_idx(indices)
+        idx = _get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
@@ -507,91 +580,12 @@ class SetCriterion(nn.Module):
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
-        targets：'boxes'=[3,4] labels=[3] ...
-        indices： [3] 如：5,35,63  匹配好的3个预测框idx
-        num_boxes：当前batch的所有gt个数
-        """
-        assert 'pred_boxes' in outputs
-        # idx tuple:2  0=[num_all_gt] 记录每个gt属于哪张图片  1=[num_all_gt] 记录每个匹配到的预测框的index
-        idx = self._get_src_permutation_idx(indices)
-        # [all_gt_num, 4]  这个batch的所有正样本的预测框坐标
-        src_boxes = outputs['pred_boxes'][idx]
-        # [all_gt_num, 4]  这个batch的所有gt框坐标
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
-        # 计算L1损失
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
-
-        losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
-        # 计算GIOU损失
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
-
-        # calculate the x,y and h,w loss
-        with torch.no_grad():
-            losses['loss_xy'] = loss_bbox[..., :2].sum() / num_boxes
-            losses['loss_hw'] = loss_bbox[..., 2:].sum() / num_boxes
-
-        # 'loss_bbox': L1回归损失   'loss_giou': giou回归损失
-        return losses
-
-    def loss_masks(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-           targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        assert "pred_masks" in outputs
-
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-        src_masks = outputs["pred_masks"]
-        src_masks = src_masks[src_idx]
-        masks = [t["masks"] for t in targets]
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
-        target_masks = target_masks.to(src_masks)
-        target_masks = target_masks[tgt_idx]
-
-        # upsample predictions to the target size
-        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
-                                mode="bilinear", align_corners=False)
-        src_masks = src_masks[:, 0].flatten(1)
-
-        target_masks = target_masks.flatten(1)
-        target_masks = target_masks.view(src_masks.shape)
-        losses = {
-            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
-            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
-        }
-        return losses
-
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        # [num_all_gt]  记录每个gt都是来自哪张图片的 idx
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        # 记录匹配到的预测框的idx
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
-
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
-            'boxes': self.loss_boxes,
-            'masks': self.loss_masks,
+            'boxes': loss_boxes,
+            'masks': loss_masks,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -897,6 +891,7 @@ def build_dino(args):
     model = DINO(
         backbone,
         transformer,
+        args.hidden_dim,
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=True,

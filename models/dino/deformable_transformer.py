@@ -440,7 +440,6 @@ class TransformerEncoder(nn.Module):
         pos: 4个flatten后特征图对应的位置编码（多尺度位置编码） [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         padding_mask: 4个flatten后特征图的mask [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64]
         """
-
         output = query
         # preparation and reshape
         # 4个flatten后特征图的归一化参考点坐标 每个特征点有4个参考点 xy坐标 [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
@@ -479,8 +478,6 @@ class TransformerDecoder(nn.Module):
         self.class_embed = None  # 策略2  two-stage Deformable DETR
         self.d_model = d_model
         self.ref_anchor_head = None
-        self.box_pred_damping = None
-        self.dec_layer_number = None
 
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
