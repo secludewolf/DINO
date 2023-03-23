@@ -21,8 +21,17 @@ from .utils import gen_encoder_output_proposals, MLP, _get_activation_fn, gen_si
 from .ops.modules import MSDeformAttn
 
 
-class DeformableTransformer(nn.Module):
+def get_valid_ratio(mask):
+    _, H, W = mask.shape
+    valid_H = torch.sum(~mask[:, :, 0], 1)
+    valid_W = torch.sum(~mask[:, 0, :], 1)
+    valid_ratio_h = valid_H.float() / H
+    valid_ratio_w = valid_W.float() / W
+    valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
+    return valid_ratio
 
+
+class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
                  num_queries=300,
                  num_encoder_layers=6,
@@ -39,8 +48,6 @@ class DeformableTransformer(nn.Module):
                  dec_n_points=4,
                  # init query
                  random_refpoints_xy=False,
-                 # two stage
-                 two_stage_type='standard',
                  # for detach
                  module_seq=None):
         super().__init__()
@@ -55,37 +62,40 @@ class DeformableTransformer(nn.Module):
         return_intermediate_dec: 是否返回decoder中间层结果  False
         """
         # 初始化一个encoderLayer
-        encoder_layer = DeformableTransformerEncoderLayer(d_model,
-                                                          dim_feedforward,
-                                                          dropout,
-                                                          activation,
-                                                          num_feature_levels,
-                                                          nhead, enc_n_points,
-                                                          )
+        encoder_layer = DeformableTransformerEncoderLayer(
+            d_model,
+            dim_feedforward,
+            dropout,
+            activation,
+            num_feature_levels,
+            nhead, enc_n_points
+        )
         # 创建整个Encoder层  6个encoder层堆叠
         self.encoder = TransformerEncoder(
             encoder_layer=encoder_layer,
             num_layers=num_encoder_layers,
             d_model=d_model,
-            num_queries=num_queries, )
-
+            num_queries=num_queries
+        )
         # 初始化一个decoderLayer
-        decoder_layer = DeformableTransformerDecoderLayer(d_model,
-                                                          dim_feedforward,
-                                                          dropout,
-                                                          activation,
-                                                          num_feature_levels,
-                                                          nhead, dec_n_points,
-                                                          key_aware_type=None,
-                                                          module_seq=module_seq)
+        decoder_layer = DeformableTransformerDecoderLayer(
+            d_model,
+            dim_feedforward,
+            dropout,
+            activation,
+            num_feature_levels,
+            nhead, dec_n_points,
+            module_seq
+        )
         # 创建整个Decoder层  6个decoder层堆叠
-        self.decoder = TransformerDecoder(decoder_layer,
-                                          num_decoder_layers,
-                                          nn.LayerNorm(d_model),
-                                          d_model=d_model,
-                                          query_dim=query_dim,
-                                          num_feature_levels=num_feature_levels,
-                                          )
+        self.decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            nn.LayerNorm(d_model),
+            d_model,
+            query_dim,
+            num_feature_levels
+        )
 
         self.num_feature_levels = num_feature_levels
         self.num_encoder_layers = num_encoder_layers
@@ -98,7 +108,6 @@ class DeformableTransformer(nn.Module):
         self.dec_layers = num_decoder_layers
         self.num_queries = num_queries  # useful for single stage model only
         self.num_patterns = num_patterns
-        self.two_stage_type = two_stage_type
         # scale-level position embedding  [4, 256]
         # 因为deformable detr用到了多尺度特征  经过backbone会生成4个不同尺度的特征图  但是如果还是使用原先的sine position embedding
         # detr是针对h和w进行编码的 不同位置的特征点会对应不同的编码值 但是deformable detr不同的特征图的不同位置就有可能会产生相同的位置编码，就无法区分了
@@ -130,15 +139,6 @@ class DeformableTransformer(nn.Module):
                 m._reset_parameters()
         if self.num_feature_levels > 1 and self.level_embed is not None:
             nn.init.normal_(self.level_embed)
-
-    def get_valid_ratio(self, mask):
-        _, H, W = mask.shape
-        valid_H = torch.sum(~mask[:, :, 0], 1)
-        valid_W = torch.sum(~mask[:, 0, :], 1)
-        valid_ratio_h = valid_H.float() / H
-        valid_ratio_w = valid_W.float() / W
-        valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
-        return valid_ratio
 
     def init_ref_points(self, use_num_queries):
         # 参考anchor detr, 类似于Anchor的作用
@@ -204,7 +204,7 @@ class DeformableTransformer(nn.Module):
         # 不同尺度特征图对应被flatten的那个维度的起始索引  Tensor[4]  如[0,15100,18900,19850]
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         # 各尺度特征图中非padding部分的边长占其边长的比例  [bs, 4, 2]  如全是1
-        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
+        valid_ratios = torch.stack([get_valid_ratio(m) for m in multi_level_masks], 1)
         #########################################################
         # Begin Encoder
         #########################################################
@@ -239,8 +239,12 @@ class DeformableTransformer(nn.Module):
         # (bs, \sum{hw}, c)
         # 对memory进行处理得到output_memory: [bs, H/8 * W/8 + ... + H/64 * W/64, 256]
         # 并生成初步output_proposals: [bs, H/8 * W/8 + ... + H/64 * W/64, 4]  其实就是特征图上的一个个的点坐标
-        output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes,
-                                                                       input_hw)
+        output_memory, output_proposals = gen_encoder_output_proposals(
+            memory,
+            mask_flatten,
+            spatial_shapes,
+            input_hw
+        )
         # 对encoder输出进行处理：全连接层 + LayerNorm
         output_memory = self.enc_output_norm(self.enc_output(output_memory))
 
@@ -261,16 +265,26 @@ class DeformableTransformer(nn.Module):
 
         # gather boxes
         # 根据前九百个位置获取对应的参考点  # topk_coords_unact: top300个分类得分最高的index对应的预测bbox [bs, 900, 4]
-        refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
-                                               topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
+        refpoint_embed_undetach = torch.gather(  # unsigmoid
+            enc_outputs_coord_unselected,
+            1,
+            topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+        )
         # 以先验框的形式存在  取消梯度
         refpoint_embed_ = refpoint_embed_undetach.detach()
         # 得到归一化参考点坐标  最终会送到decoder中作为初始的参考点
-        init_box_proposal = torch.gather(output_proposals, 1,
-                                         topk_proposals.unsqueeze(-1).repeat(1, 1, 4)).sigmoid()
+        init_box_proposal = torch.gather(
+            output_proposals,
+            1,
+            topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+        ).sigmoid()
 
         # gather tgt  # 根据前九百个位置获取query
-        tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
+        tgt_undetach = torch.gather(
+            output_memory,
+            1,
+            topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model)
+        )
         tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # nq, bs, d_model
 
         if refpoint_embed is not None:  # 训练 query + cdn_query
@@ -312,15 +326,17 @@ class DeformableTransformer(nn.Module):
         # inter_references: 6层decoder学习到的参考点归一化中心坐标  [6, bs, 900 + 200, 2]
         #                   one-stage=[n_decoder, bs, num_query, 2]  two-stage=[n_decoder, bs, num_query, 4]
         hs, references = self.decoder(
-            tgt=tgt.transpose(0, 1),
-            memory=memory.transpose(0, 1),
-            memory_key_padding_mask=mask_flatten,
-            pos=lvl_pos_embed_flatten.transpose(0, 1),
+            query=tgt.transpose(0, 1),
+            key=memory.transpose(0, 1),
+            value=memory.transpose(0, 1),
+            query_pos=None,
+            key_padding_mask=mask_flatten,
             refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
-            level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
             valid_ratios=valid_ratios,
-            tgt_mask=attn_mask)
+            attn_mask=attn_mask,
+        )
         #########################################################
         # End Decoder
         # hs: n_dec, bs, nq, d_model
@@ -346,12 +362,11 @@ class DeformableTransformer(nn.Module):
         # hs: (n_dec, bs, nq, d_model)
         # references: sigmoid coordinates. (n_dec+1, bs, bq, 4)
         # hs_enc: (n_enc+1, bs, nq, d_model) or (1, bs, nq, d_model) or None
-        # ref_enc: sigmoid coordinates. \
-        #           (n_enc+1, bs, nq, query_dim) or (1, bs, nq, query_dim) or None
+        # ref_enc: sigmoid coordinates.
+        # (n_enc+1, bs, nq, query_dim) or (1, bs, nq, query_dim) or None
 
 
 class TransformerEncoder(nn.Module):
-
     def __init__(self,
                  encoder_layer,
                  num_layers,
@@ -370,7 +385,6 @@ class TransformerEncoder(nn.Module):
         self.num_queries = num_queries
         self.num_layers = num_layers
         self.d_model = d_model
-        self.two_stage_type = "standard"
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
@@ -440,17 +454,22 @@ class TransformerEncoder(nn.Module):
         pos: 4个flatten后特征图对应的位置编码（多尺度位置编码） [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         padding_mask: 4个flatten后特征图的mask [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64]
         """
-        output = query
         # preparation and reshape
         # 4个flatten后特征图的归一化参考点坐标 每个特征点有4个参考点 xy坐标 [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=query.device)
         for layer_id, layer in enumerate(self.layers):
-            output = layer(src=output, pos=query_pos, reference_points=reference_points,
-                           spatial_shapes=spatial_shapes, level_start_index=level_start_index,
-                           key_padding_mask=query_key_padding_mask)
+            query = layer(query=query,
+                          key=key,
+                          valule=value,
+                          query_pos=query_pos,
+                          reference_points=reference_points,
+                          spatial_shapes=spatial_shapes,
+                          level_start_index=level_start_index,
+                          key_padding_mask=query_key_padding_mask,
+                          )
         # 经过6层encoder增强后的新特征  每一层不断学习特征层中每个位置和4个采样点的相关性，最终输出的特征是增强后的特征图
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
-        return output
+        return query
 
 
 class TransformerDecoder(nn.Module):
@@ -479,17 +498,18 @@ class TransformerDecoder(nn.Module):
         self.d_model = d_model
         self.ref_anchor_head = None
 
-    def forward(self, tgt, memory,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
+    def forward(self,
+                query,
+                key,
+                value,
+                query_pos=None,
+                key_padding_mask: Optional[Tensor] = None,
                 refpoints_unsigmoid: Optional[Tensor] = None,  # num_queries, bs, 2
-                # for memory
-                level_start_index: Optional[Tensor] = None,  # num_levels
                 spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-                valid_ratios: Optional[Tensor] = None):
+                level_start_index: Optional[Tensor] = None,  # num_levels
+                valid_ratios: Optional[Tensor] = None,
+                attn_mask: Optional[Tensor] = None,
+                ):
         """
         Input:
             - tgt: nq, bs, d_model
@@ -500,8 +520,6 @@ class TransformerDecoder(nn.Module):
             tgt: [900 + 200, bs, 256] 预设的query embedding
             memory: [H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, bs, 256] 来自backbone的多层特征信息
             tgt_mask: [1100, 1100] query遮罩
-            memory_mask: None
-            tgt_key_padding_mask: None
             memory_key_padding_mask: [batch, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, bs, 256] 来自backbone的遮罩信息
             pos: [H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, bs, 256] 来自backbone的位置信息
             refpoints_unsigmoid: [1100, 1, 4] query的参考点 替代了query pos
@@ -509,7 +527,7 @@ class TransformerDecoder(nn.Module):
             spatial_shapes: [4, 2] 每层的实际大小
             valid_raitos: [bs, 4, 2] 每层图片padding后实际所占的比例
         """
-        output = tgt
+        output = query
 
         intermediate = []  # 中间各层+首尾两层=6层输出的解码结果
         reference_points = refpoints_unsigmoid.sigmoid()  # 中间各层+首尾两层输出的参考点（不断矫正）
@@ -531,18 +549,15 @@ class TransformerDecoder(nn.Module):
 
             # random drop some layers if needed
             output = layer(
-                tgt=output,  # [1100, 1, 256]上一层的输出
-                tgt_query_pos=query_pos,  # 位置编码
-                tgt_query_sine_embed=query_sine_embed,  # 位置编码的Embedding
-                tgt_key_padding_mask=tgt_key_padding_mask,  # None
-                tgt_reference_points=reference_points_input,  # [1100, 1, 4, 4] nq, bs, nlevel, 4 参考点
-                memory=memory,  # [hw, bs, 256]
-                memory_key_padding_mask=memory_key_padding_mask,  # [bs, hw]
-                memory_level_start_index=level_start_index,  # [4,] 层起始位置
-                memory_spatial_shapes=spatial_shapes,  # [4, 2] 层大小
-                memory_pos=pos,  # [hw, bs, 256] backbone特征位置编码
-                self_attn_mask=tgt_mask,  # [1100, 1100] 遮罩
-                cross_attn_mask=memory_mask  # None
+                query=output,  # [1100, 1, 256]上一层的输出
+                key=key,  # [hw, bs, 256]
+                value=value,
+                query_pos=query_pos,  # 位置编码
+                key_padding_mask=key_padding_mask,  # [bs, hw]
+                key_level_start_index=level_start_index,  # [4,] 层起始位置
+                key_spatial_shapes=spatial_shapes,  # [4, 2] 层大小
+                attn_mask=attn_mask,  # [1100, 1100] 遮罩
+                reference_points=reference_points_input,  # [1100, 1, 4, 4] nq, bs, nlevel, 4 参考点
             )
 
             # iter update
@@ -598,7 +613,16 @@ class DeformableTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, key_padding_mask=None):
+    def forward(self,
+                query,
+                key,
+                value,
+                query_pos,
+                reference_points,
+                spatial_shapes,
+                level_start_index,
+                key_padding_mask=None
+                ):
         """
         src: 多尺度特征图(4个flatten后的特征图)  [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
         reference_points: 4个flatten后特征图对应的归一化参考点坐标 [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 4, 2]
@@ -612,23 +636,28 @@ class DeformableTransformerEncoderLayer(nn.Module):
         # key = 采样点  每个特征点对应周围的4个可学习的采样点
         # value = flatten后的多尺度特征图
         # self attention
-        src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index,
-                              key_padding_mask)
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
+        src2 = self.self_attn(
+            self.with_pos_embed(query, query_pos),
+            reference_points,
+            query,
+            spatial_shapes,
+            level_start_index,
+            key_padding_mask,
+        )
+        query = query + self.dropout1(src2)
+        query = self.norm1(query)
 
         # ffn   feed forward + add + norm
-        src = self.forward_ffn(src)
+        query = self.forward_ffn(query)
 
         # [bs, H/8 * W/8 + H/16 * W/16 + H/32 * W/32 + H/64 * W/64, 256]
-        return src
+        return query
 
 
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
                  n_levels=4, n_heads=8, n_points=4,
-                 key_aware_type=None,
                  module_seq=None,
                  ):
         super().__init__()
@@ -652,7 +681,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
-        self.key_aware_type = key_aware_type
         self.key_aware_proj = None
 
     def rm_self_attn_modules(self):
@@ -671,75 +699,53 @@ class DeformableTransformerDecoderLayer(nn.Module):
         return tgt
 
     def forward_sa(self,
-                   # for tgt
-                   tgt: Optional[Tensor],  # nq, bs, d_model
-                   tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                   # sa
-                   self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
+                   query: Optional[Tensor],  # nq, bs, d_model
+                   query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
+                   attn_mask: Optional[Tensor] = None,  # mask used for self-attention
                    ):
         # self attention
-        q = k = self.with_pos_embed(tgt, tgt_query_pos)
+        q = k = self.with_pos_embed(query, query_pos)
         # 第一个attention的目的：学习各个物体之间的关系/位置   可以知道图像当中哪些位置会存在物体  物体信息->tgt
         # 所以qk都是query embedding + query pos   v就是query embedding
-        tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
+        tgt2 = self.self_attn(q, k, query, attn_mask=attn_mask)[0]
+        query = query + self.dropout2(tgt2)
+        query = self.norm2(query)
 
-        return tgt
+        return query
 
     def forward_ca(self,
-                   # for tgt
-                   tgt: Optional[Tensor],  # nq, bs, d_model
-                   tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                   tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
-
-                   # for memory
-                   memory: Optional[Tensor] = None,  # hw, bs, d_model
-                   memory_key_padding_mask: Optional[Tensor] = None,
-                   memory_level_start_index: Optional[Tensor] = None,  # num_levels
-                   memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
+                   query: Optional[Tensor],  # nq, bs, d_model
+                   query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
+                   reference_points: Optional[Tensor] = None,  # nq, bs, 4
+                   key: Optional[Tensor] = None,  # hw, bs, d_model
+                   key_padding_mask: Optional[Tensor] = None,
+                   key_level_start_index: Optional[Tensor] = None,  # num_levels
+                   key_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
                    ):
-        # cross attention
-        if self.key_aware_type is not None:
-
-            if self.key_aware_type == 'mean':
-                tgt = tgt + memory.mean(0, keepdim=True)
-            elif self.key_aware_type == 'proj_mean':
-                tgt = tgt + self.key_aware_proj(memory).mean(0, keepdim=True)
-            else:
-                raise NotImplementedError("Unknown key_aware_type: {}".format(self.key_aware_type))
         # cross attention  使用（多尺度）可变形注意力模块替代原生的Transformer交叉注意力
         # 第二个attention的目的：不断增强encoder的输出特征，将物体的信息不断加入encoder的输出特征中去，更好地表征了图像中的各个物体
         # 所以q=query embedding + query pos, k = query pos通过一个全连接层->2维, v=上一层输出的output
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
-                               tgt_reference_points.transpose(0, 1).contiguous(),
-                               memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
-                               memory_key_padding_mask).transpose(0, 1)
+        tgt2 = self.cross_attn(self.with_pos_embed(query, query_pos).transpose(0, 1),
+                               reference_points.transpose(0, 1).contiguous(),
+                               key.transpose(0, 1), key_spatial_shapes, key_level_start_index,
+                               key_padding_mask).transpose(0, 1)
         # add + norm
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
+        query = query + self.dropout1(tgt2)
+        query = self.norm1(query)
         # [bs, 300, 256]  self-attention输出特征 + cross-attention输出特征
         # 最终的特征：知道图像中物体与物体之间的位置关系 + encoder增强后的图像特征 + 图像与物体之间的关系
-        return tgt
+        return query
 
     def forward(self,
-                # for tgt
-                tgt: Optional[Tensor],  # nq, bs, d_model
-                tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
-
-                # for memory
-                memory: Optional[Tensor] = None,  # hw, bs, d_model
-                memory_key_padding_mask: Optional[Tensor] = None,
-                memory_level_start_index: Optional[Tensor] = None,  # num_levels
-                memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-                memory_pos: Optional[Tensor] = None,  # pos for memory
-
-                # sa
-                self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
-                cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
+                query: Optional[Tensor],  # nq, bs, d_model
+                key: Optional[Tensor] = None,  # hw, bs, d_model
+                value: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
+                key_padding_mask: Optional[Tensor] = None,
+                key_level_start_index: Optional[Tensor] = None,  # num_levels
+                key_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
+                attn_mask: Optional[Tensor] = None,  # mask used for self-attention
+                reference_points: Optional[Tensor] = None,  # nq, bs, 4
                 ):
         """
         tgt: 预设的query embedding [bs, 300, 256]
@@ -753,22 +759,22 @@ class DeformableTransformerDecoderLayer(nn.Module):
         """
         for funcname in self.module_seq:
             if funcname == 'ffn':
-                tgt = self.forward_ffn(tgt)
+                query = self.forward_ffn(query)
             elif funcname == 'ca':
-                tgt = self.forward_ca(tgt=tgt,
-                                      tgt_query_pos=tgt_query_pos,
-                                      tgt_reference_points=tgt_reference_points,
-                                      memory=memory,
-                                      memory_key_padding_mask=memory_key_padding_mask,
-                                      memory_level_start_index=memory_level_start_index,
-                                      memory_spatial_shapes=memory_spatial_shapes,
-                                      )
+                query = self.forward_ca(query=query,
+                                        query_pos=query_pos,
+                                        reference_points=reference_points,
+                                        key=key,
+                                        key_padding_mask=key_padding_mask,
+                                        key_level_start_index=key_level_start_index,
+                                        key_spatial_shapes=key_spatial_shapes,
+                                        )
             elif funcname == 'sa':
-                tgt = self.forward_sa(tgt=tgt,
-                                      tgt_query_pos=tgt_query_pos,
-                                      self_attn_mask=self_attn_mask, )
-
-        return tgt
+                query = self.forward_sa(query=query,
+                                        query_pos=query_pos,
+                                        attn_mask=attn_mask,
+                                        )
+        return query
 
 
 def _get_clones(module, size, layer_share=False):
@@ -796,6 +802,5 @@ def build_deformable_transformer(args):
         dec_n_points=args.dec_n_points,
         random_refpoints_xy=args.random_refpoints_xy,
         # two stage
-        two_stage_type=args.two_stage_type,
         module_seq=args.decoder_module_seq,
     )
