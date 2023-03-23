@@ -185,7 +185,6 @@ def build_position_encoding(args):
     # 二维位置编码   前128维代表x方向位置编码  后128维代表y方向位置编码
     N_steps = args.hidden_dim // 2
     if args.position_embedding in ('v2', 'sine'):
-        # TODO find a better way of exposing other arguments
         # 余弦编码方式
         # [bs,256,19,26]  dim=1时  前128个是y方向位置编码  后128个是x方向位置编码
         position_embedding = PositionEmbeddingSineHW(

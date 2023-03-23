@@ -485,7 +485,6 @@ def loss_masks(outputs, targets, indices, num_boxes):
     src_masks = outputs["pred_masks"]
     src_masks = src_masks[src_idx]
     masks = [t["masks"] for t in targets]
-    # TODO use valid to mask invalid areas due to padding in loss
     target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
     target_masks = target_masks.to(src_masks)
     target_masks = target_masks[tgt_idx]
@@ -560,7 +559,6 @@ class SetCriterion(nn.Module):
         losses = {'loss_ce': loss_ce}
         # 日志 记录分类误差
         if log:
-            # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         # losses: 'loss_ce': 分类损失
         #         'class_error':Top-1精度 即预测概率最大的那个类别与对应被分配的GT类别是否一致  这部分仅用于日志显示 并不参与模型训练
@@ -939,7 +937,6 @@ def build_dino(args):
         weight_dict["loss_dice"] = args.dice_loss_coef
     clean_weight_dict = copy.deepcopy(weight_dict)
 
-    # TODO this is a hack
     if args.aux_loss:  # 辅助损失  每个decoder都参与计算损失  True
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):

@@ -64,7 +64,6 @@ class DETRsegm(nn.Module):
         if self.detr.aux_loss:
             out['aux_outputs'] = self.detr._set_aux_loss(outputs_class, outputs_coord)
 
-        # FIXME h_boxes takes the last one computed, keep this in mind
         bbox_mask = self.bbox_attention(hs[-1], memory, mask=mask)
 
         seg_masks = self.mask_head(src_proj, bbox_mask, [features[2].tensors, features[1].tensors, features[0].tensors])

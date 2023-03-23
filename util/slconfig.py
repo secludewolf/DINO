@@ -132,7 +132,6 @@ class SLConfig(object):
             for c in cfg_dict_list:
                 if len(base_cfg_dict.keys() & c.keys()) > 0:
                     raise KeyError('Duplicate key is not allowed among bases')
-                    # TODO Allow the duplicate key while warnning user
                 base_cfg_dict.update(c)
 
             base_cfg_dict = SLConfig._merge_a_into_b(cfg_dict, base_cfg_dict)
